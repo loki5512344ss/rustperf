@@ -7,7 +7,7 @@
 //! reader would assume. The human decides whether to fix it or read the
 //! numbers skeptically; nothing here gates anything.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// One diagnostic finding.
 ///
@@ -39,7 +39,9 @@ pub fn run(root: &Path) -> Vec<Check> {
         on_battery(),
         cargo_incremental(),
         bench_profile_opt_level(root),
+        dependency_cooldown(root),
         nightly_default_toolchain(root),
+        toolchain_age(),
     ]
 }
 
@@ -448,6 +450,226 @@ fn nightly_default_toolchain(root: &Path) -> Check {
     }
 }
 
+// --- Rust-specific: dependency cooldown ([registry] global-min-publish-age) --
+
+/// Cargo config files that could hold `[registry] global-min-publish-age`,
+/// most specific first: the repository's own `.cargo`, then `CARGO_HOME`,
+/// then the default `$HOME/.cargo`. Cargo itself looks for `config.toml`
+/// before the older `config` in each directory, so this mirrors that.
+fn cargo_config_candidates(
+    root: &Path,
+    cargo_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut dirs = vec![root.join(".cargo")];
+    if let Some(h) = cargo_home {
+        dirs.push(h.to_path_buf());
+    }
+    if let Some(h) = home {
+        dirs.push(h.join(".cargo"));
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        for name in ["config.toml", "config"] {
+            let p = dir.join(name);
+            // `CARGO_HOME` often *is* `$HOME/.cargo`; do not read it twice.
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Whether Cargo is configured to refuse crates newer than a cooldown window
+/// (RFC 3923). Injectable by directory so tests never touch the real
+/// `$CARGO_HOME` or `$HOME`.
+fn dependency_cooldown_at(root: &Path, cargo_home: Option<&Path>, home: Option<&Path>) -> Check {
+    const NAME: &str = "dependency cooldown";
+    for path in cargo_config_candidates(root, cargo_home, home) {
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            // Missing files are the normal case and simply mean "keep
+            // looking"; only a file that exists but cannot be read is a
+            // finding.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return check(
+                    NAME,
+                    false,
+                    format!("could not read {}: {e}", path.display()),
+                );
+            }
+        };
+        let value: toml::Value = match toml::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                return check(
+                    NAME,
+                    false,
+                    format!("{} is not valid TOML: {e}", path.display()),
+                );
+            }
+        };
+        let Some(v) = value
+            .get("registry")
+            .and_then(|r| r.get("global-min-publish-age"))
+        else {
+            // A readable config that does not set the key: keep looking in
+            // the less specific locations.
+            continue;
+        };
+        let value = match v.as_str() {
+            Some(s) => s.to_string(),
+            None => v.to_string(),
+        };
+        return check(NAME, true, format!("{value} — set in {}", path.display()));
+    }
+    check(
+        NAME,
+        false,
+        "not set — consider [registry] global-min-publish-age = \"3 days\" in \
+         .cargo/config.toml (malicious releases are usually caught within days, RFC 3923)",
+    )
+}
+
+fn dependency_cooldown(root: &Path) -> Check {
+    let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from);
+    let home = dirs::home_dir();
+    dependency_cooldown_at(root, cargo_home.as_deref(), home.as_deref())
+}
+
+// --- Rust-specific: how fresh the compiler is -------------------------------
+
+/// Days from 1970-01-01 to `y-m-d` in the proleptic Gregorian calendar,
+/// negative before the epoch. Howard Hinnant's `days_from_civil`, the standard
+/// all-integer civil-from-days algorithm.
+fn days_since_epoch(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    // Shift negative years into the same 400-year era arithmetic as positive
+    // ones instead of relying on Rust's truncating division.
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (m + 9) % 12; // [0, 11], March-based
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Parses a strict `YYYY-MM-DD` into `(year, month, day)`.
+fn parse_ymd(s: &str) -> Option<(i64, i64, i64)> {
+    let mut parts = s.split('-');
+    let y = parts.next()?.parse().ok()?;
+    let m = parts.next()?.parse().ok()?;
+    let d = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some((y, m, d))
+}
+
+/// Reads one `key: value` line out of `rustc -Vv`, e.g. `release: 1.100.0`.
+fn vv_field<'a>(vv: &'a str, key: &str) -> Option<&'a str> {
+    vv.lines()
+        .find_map(|line| line.strip_prefix(key))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
+/// How many days old a release must be before its codegen is considered
+/// settled.
+const TOOLCHAIN_AGE_WARN_DAYS: i64 = 7;
+
+/// Turns `rustc -Vv` into a finding. Pure: `today_days` is injected so tests
+/// neither run `rustc` nor depend on the current date.
+fn toolchain_age_from(vv: &str, today_days: i64) -> Check {
+    const NAME: &str = "toolchain age";
+    let Some(release) = vv_field(vv, "release:") else {
+        return check(NAME, true, "not checked: no `release:` line in `rustc -Vv`");
+    };
+    let Some(date) = vv_field(vv, "commit-date:") else {
+        return check(
+            NAME,
+            true,
+            "not checked: no `commit-date:` line in `rustc -Vv`",
+        );
+    };
+    let Some((y, m, d)) = parse_ymd(date) else {
+        return check(
+            NAME,
+            true,
+            format!("not checked: `commit-date: {date}` is not YYYY-MM-DD"),
+        );
+    };
+    let age = today_days - days_since_epoch(y, m, d);
+    if age < 0 {
+        return check(
+            NAME,
+            true,
+            format!(
+                "not checked: commit-date {date} is {} day(s) in the future — the system clock or \
+                 the toolchain metadata is off",
+                -age
+            ),
+        );
+    }
+    let channel = if release.contains("nightly") {
+        Some("nightly")
+    } else if release.contains("beta") {
+        Some("beta")
+    } else {
+        None
+    };
+    // `-Z` flags only exist on nightly, so the lever is offered for nightly
+    // alone; beta gets a note that its codegen is not the last stable's.
+    let note = match channel {
+        Some("nightly") => {
+            "; nightly channel: -Zunstable-options --jobs-frontend=N is a build-time lever for \
+             faster builds"
+        }
+        Some("beta") => "; beta channel: codegen can differ from the last stable release",
+        _ => "",
+    };
+    let day_word = if age == 1 { "day" } else { "days" };
+    if age < TOOLCHAIN_AGE_WARN_DAYS {
+        check(
+            NAME,
+            false,
+            format!(
+                "rustc {release} released {age} {day_word} ago — codegen fixes are still landing; \
+                 timings can change with a fresh compiler{note}"
+            ),
+        )
+    } else {
+        check(
+            NAME,
+            true,
+            format!("rustc {release}, released {age} {day_word} ago{note}"),
+        )
+    }
+}
+
+fn today_days() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => (d.as_secs() / 86_400) as i64,
+        Err(_) => 0,
+    }
+}
+
+fn toolchain_age() -> Check {
+    match std::process::Command::new("rustc").arg("-Vv").output() {
+        Ok(out) if out.status.success() => {
+            toolchain_age_from(&String::from_utf8_lossy(&out.stdout), today_days())
+        }
+        Ok(_) => check("toolchain age", true, "not checked: `rustc -Vv` failed"),
+        Err(e) => check(
+            "toolchain age",
+            true,
+            format!("not checked: `rustc -Vv` unavailable ({e})"),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,6 +832,253 @@ mod tests {
         let c = nightly_default_toolchain_from("rustc 1.90.0-nightly (abcdef 2026-01-01)\n");
         assert!(!c.ok);
         assert!(c.detail.contains("nightly"));
+    }
+
+    // --- dependency cooldown ------------------------------------------------
+
+    #[test]
+    fn a_cooldown_in_the_repository_config_is_ok() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".cargo")).unwrap();
+        std::fs::write(
+            d.path().join(".cargo/config.toml"),
+            "[registry]\nglobal-min-publish-age = \"3 days\"\n",
+        )
+        .unwrap();
+        let c = dependency_cooldown_at(d.path(), None, None);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("3 days"), "{}", c.detail);
+        assert!(c.detail.contains("config.toml"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_missing_cooldown_is_flagged_with_a_suggestion() {
+        let d = tempfile::tempdir().unwrap();
+        let c = dependency_cooldown_at(d.path(), None, None);
+        assert!(!c.ok);
+        assert!(c.detail.contains("global-min-publish-age"), "{}", c.detail);
+        assert!(c.detail.contains("3 days"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_cooldown_in_cargo_home_is_found() {
+        let root = tempfile::tempdir().unwrap();
+        let cargo_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cargo_home.path().join("config.toml"),
+            "[registry]\nglobal-min-publish-age = \"7 days\"\n",
+        )
+        .unwrap();
+        let c = dependency_cooldown_at(root.path(), Some(cargo_home.path()), None);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("7 days"), "{}", c.detail);
+        assert!(
+            c.detail.contains(&cargo_home.path().display().to_string()),
+            "{}",
+            c.detail
+        );
+    }
+
+    #[test]
+    fn a_cooldown_in_the_home_cargo_config_is_found() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".cargo")).unwrap();
+        std::fs::write(
+            home.path().join(".cargo/config.toml"),
+            "[registry]\nglobal-min-publish-age = \"2 days\"\n",
+        )
+        .unwrap();
+        let c = dependency_cooldown_at(root.path(), None, Some(home.path()));
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("2 days"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_dotless_cargo_config_file_is_accepted() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".cargo")).unwrap();
+        std::fs::write(
+            d.path().join(".cargo/config"),
+            "[registry]\nglobal-min-publish-age = \"4 days\"\n",
+        )
+        .unwrap();
+        assert!(dependency_cooldown_at(d.path(), None, None).ok);
+    }
+
+    #[test]
+    fn the_repository_config_wins_over_cargo_home() {
+        let root = tempfile::tempdir().unwrap();
+        let cargo_home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
+        std::fs::write(
+            root.path().join(".cargo/config.toml"),
+            "[registry]\nglobal-min-publish-age = \"3 days\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cargo_home.path().join("config.toml"),
+            "[registry]\nglobal-min-publish-age = \"30 days\"\n",
+        )
+        .unwrap();
+        let c = dependency_cooldown_at(root.path(), Some(cargo_home.path()), None);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("3 days"), "{}", c.detail);
+        assert!(!c.detail.contains("30 days"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_malformed_cargo_config_is_flagged_naming_the_path() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".cargo")).unwrap();
+        let path = d.path().join(".cargo/config.toml");
+        std::fs::write(&path, "not valid toml [[[").unwrap();
+        let c = dependency_cooldown_at(d.path(), None, None);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains(&path.display().to_string()),
+            "{}",
+            c.detail
+        );
+    }
+
+    #[test]
+    fn an_unreadable_cargo_config_is_flagged_naming_the_path() {
+        let d = tempfile::tempdir().unwrap();
+        // A directory where a config file should be: `read_to_string` fails.
+        std::fs::create_dir_all(d.path().join(".cargo/config.toml")).unwrap();
+        let c = dependency_cooldown_at(d.path(), None, None);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("config.toml"), "{}", c.detail);
+    }
+
+    // --- toolchain age ------------------------------------------------------
+
+    #[test]
+    fn days_since_epoch_matches_well_known_dates() {
+        assert_eq!(days_since_epoch(1970, 1, 1), 0);
+        assert_eq!(days_since_epoch(2000, 1, 1), 10957);
+        assert_eq!(days_since_epoch(2026, 11, 17), 20774);
+        assert_eq!(days_since_epoch(2026, 11, 18), 20775);
+        // Leap day, both a leap and a non-leap February.
+        assert_eq!(
+            days_since_epoch(2024, 3, 1),
+            days_since_epoch(2024, 2, 29) + 1
+        );
+        assert_eq!(
+            days_since_epoch(2023, 3, 1),
+            days_since_epoch(2023, 2, 28) + 1
+        );
+    }
+
+    const FRESH_VV: &str = "rustc 1.100.0 (5e3d9a4c3 2026-11-15)\n\
+binary: rustc\n\
+commit-hash: 5e3d9a4c3f0a0d1e2f3a4b5c6d7e8f9012345678\n\
+commit-date: 2026-11-15\n\
+host: x86_64-unknown-linux-gnu\n\
+release: 1.100.0\n\
+LLVM version: 21.1.2\n";
+
+    #[test]
+    fn a_toolchain_released_days_ago_is_flagged() {
+        let today = days_since_epoch(2026, 11, 17);
+        let c = toolchain_age_from(FRESH_VV, today);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("2 days ago"), "{}", c.detail);
+        assert!(c.detail.contains("timings can change"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_toolchain_released_today_is_flagged() {
+        let today = days_since_epoch(2026, 11, 15);
+        let c = toolchain_age_from(FRESH_VV, today);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("0 days ago"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_toolchain_seven_days_old_is_no_longer_flagged() {
+        let today = days_since_epoch(2026, 11, 22);
+        let c = toolchain_age_from(FRESH_VV, today);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("7 days ago"), "{}", c.detail);
+    }
+
+    #[test]
+    fn an_older_stable_toolchain_is_ok_and_names_the_version() {
+        let vv = FRESH_VV.replace("2026-11-15", "2026-09-01");
+        let today = days_since_epoch(2026, 11, 17);
+        let c = toolchain_age_from(&vv, today);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("1.100.0"), "{}", c.detail);
+        assert!(!c.detail.contains("--jobs-frontend"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_nightly_toolchain_mentions_the_frontend_jobs_lever() {
+        let vv = FRESH_VV.replace("release: 1.100.0", "release: 1.93.0-nightly");
+        let today = days_since_epoch(2026, 11, 17);
+        let c = toolchain_age_from(&vv, today);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("-Zunstable-options"), "{}", c.detail);
+        assert!(c.detail.contains("--jobs-frontend=N"), "{}", c.detail);
+        assert!(c.detail.contains("nightly"), "{}", c.detail);
+    }
+
+    #[test]
+    fn an_old_nightly_still_mentions_the_frontend_jobs_lever() {
+        let vv = FRESH_VV
+            .replace("release: 1.100.0", "release: 1.93.0-nightly")
+            .replace("2026-11-15", "2026-09-01");
+        let today = days_since_epoch(2026, 11, 17);
+        let c = toolchain_age_from(&vv, today);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("--jobs-frontend=N"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_beta_toolchain_is_named_as_beta() {
+        let vv = FRESH_VV.replace("release: 1.100.0", "release: 1.101.0-beta.3");
+        let today = days_since_epoch(2026, 11, 17);
+        let c = toolchain_age_from(&vv, today);
+        assert!(c.detail.contains("beta"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_vv_without_a_commit_date_is_not_a_finding() {
+        let c = toolchain_age_from("rustc 1.100.0 (abc 2026-11-15)\nrelease: 1.100.0\n", 20774);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.starts_with("not checked:"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_vv_without_a_release_line_is_not_a_finding() {
+        let c = toolchain_age_from("commit-date: 2026-11-15\n", 20774);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.starts_with("not checked:"), "{}", c.detail);
+    }
+
+    #[test]
+    fn an_unparsable_commit_date_is_not_a_finding() {
+        let vv = FRESH_VV.replace("commit-date: 2026-11-15", "commit-date: yesterday");
+        let c = toolchain_age_from(&vv, 20774);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.starts_with("not checked:"), "{}", c.detail);
+    }
+
+    #[test]
+    fn empty_rustc_output_is_not_a_finding() {
+        let c = toolchain_age_from("", 20774);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.starts_with("not checked:"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_commit_date_in_the_future_is_not_a_finding() {
+        let today = days_since_epoch(2026, 11, 1);
+        let c = toolchain_age_from(FRESH_VV, today);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("future"), "{}", c.detail);
     }
 
     #[test]

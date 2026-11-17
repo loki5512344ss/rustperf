@@ -222,8 +222,9 @@ Limits — the proof is only as wide as these:
 - A proof of `old == new` inherits any bug in `old`. Add independent
   properties (bounds, monotonicity) where the contract has them.
 
-**Kani is not installed on this machine: the harness and commands above are
-`not verified on this machine` (API as documented by the Kani project).**
+**Verified 2026-11-13 with kani 0.68.0 (`cargo kani`): `old(v, i) == new(v, i)`
+was proved for slices of length 1–4 (VERIFICATION SUCCESSFUL, 0.7 s). Other
+functions, larger bounds and heap-heavy code were not tried.**
 
 ## 8c. Differential-fuzz scaffold (no dependencies)
 
@@ -250,7 +251,7 @@ Where it sits:
 | `diff-fuzz.sh` scaffold | pseudo-random + fixed boundary sizes, plain `cargo test` | output mismatches on common shapes | no shrinking, no coverage guidance |
 | `proptest` | generated with strategies, shrinks failures | mismatches with a minimal counterexample | a dev-dependency |
 | `cargo-fuzz` (libFuzzer) | coverage-guided mutation, hours | rare paths, panics, UB with sanitizers | nightly, a fuzz crate, CPU time (not installed here) |
-| Kani (§8b) | all inputs within a bound | any violation within the bound | bounds, solver time (not installed here) |
+| Kani (§8b) | all inputs within a bound | any violation within the bound | bounds, solver time (verified once, see above) |
 
 Use the scaffold first because it needs nothing; move to proptest when you
 need shrinking, to cargo-fuzz when the input is a format (parser, decoder),

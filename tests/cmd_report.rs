@@ -9,6 +9,7 @@ fn row(status: &str, score: f64) -> Row {
         best_bench_delta: -10.0,
         status: status.into(),
         description: "x".into(),
+        version: "0.3.0".into(),
     }
 }
 
@@ -91,4 +92,20 @@ fn profile_without_samply_explains_how_to_install_it_and_exits_zero() {
         "profile is advisory and must not fail a run"
     );
     assert!(text.contains("cargo install samply"), "{text}");
+}
+
+#[test]
+fn report_json_is_one_parseable_object_with_the_same_numbers() {
+    let repo = TestRepo::demo();
+    let p = repo.path().join(results::RESULTS_PATH);
+    results::append(&p, &row("KEEP", 0.8)).unwrap();
+    results::append(&p, &row("KEEP", 0.5)).unwrap();
+    results::append(&p, &row("DISCARD", 1.0)).unwrap();
+
+    let out = common::run_cli(&repo, &["report", "--json"]);
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");
+    assert_eq!(v["experiments"], 3);
+    assert_eq!(v["keep"], 2);
+    assert!((v["cumulative_score"].as_f64().unwrap() - 0.4).abs() < 1e-9);
 }

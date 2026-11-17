@@ -94,11 +94,18 @@ pub fn gate(status: Status, reason: Reason, message: impl Into<String>) -> Verdi
     }
 }
 
+/// A median slowdown at least this large trips the regression guard whatever
+/// its p-value. With few rounds and a noisy benchmark the U test cannot reach
+/// significance, so a significance-only guard let a 50 % slowdown through as
+/// "not proven". Discarding on a large unproven regression costs one
+/// experiment; accepting it costs a regression nobody saw.
+pub const LARGE_REGRESSION_PCT: f64 = 50.0;
+
 /// Applies the scoring rules.
 ///
-/// 1. Any regression significant at the raw, **uncorrected** alpha and larger
-///    than `max_regress_pct` rejects the change however good the overall
-///    score. This deliberately skips the Bonferroni correction from rule 2:
+/// 1. Any regression larger than `max_regress_pct` and either significant at
+///    the raw, **uncorrected** alpha or at least [`LARGE_REGRESSION_PCT`]
+///    rejects the change however good the overall score. This deliberately skips the Bonferroni correction from rule 2:
 ///    the correction only ever makes it harder to call a result significant,
 ///    so applying it here would make the guard less sensitive to harm —
 ///    backwards from what a guard is for. Be conservative about accepting a
@@ -124,7 +131,10 @@ pub fn decide(input: Input) -> VerdictResult {
     let regressions: Vec<Delta> = input
         .deltas
         .iter()
-        .filter(|d| d.significant && d.pct_change > input.max_regress_pct)
+        .filter(|d| {
+            d.pct_change > input.max_regress_pct
+                && (d.significant || d.pct_change >= LARGE_REGRESSION_PCT)
+        })
         .cloned()
         .collect();
     if !regressions.is_empty() {
@@ -336,6 +346,24 @@ mod tests {
             0.85,
         ));
         assert_eq!(r.status, Status::Keep);
+    }
+
+    #[test]
+    fn a_large_regression_trips_the_guard_even_when_not_significant() {
+        let r = decide(input(
+            vec![delta("a", -30.0, 0.001), delta("b", 60.0, 0.4)],
+            0.85,
+        ));
+        assert_eq!(r.status, Status::Discard);
+        assert_eq!(r.reason, Reason::GuardRegression);
+        assert_eq!(r.regressions[0].name, "b");
+    }
+
+    #[test]
+    fn the_large_regression_floor_never_undercuts_a_looser_limit() {
+        let mut i = input(vec![delta("a", -30.0, 0.001), delta("b", 60.0, 0.4)], 0.85);
+        i.max_regress_pct = 80.0;
+        assert_eq!(decide(i).status, Status::Keep);
     }
 
     #[test]

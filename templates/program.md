@@ -158,7 +158,8 @@ not a verdict at all but an interrupted experiment; see "Stopping" below.
 `reason` is a stable, machine-readable code, e.g. `improved`,
 `no_significant_improvement`, `improvement_below_min_effect`,
 `guard_regression`, `scope_violation`, `config_changed`,
-`inline_test_modified`, `unsafe_added`, `new_test_file`, `missing_test_file`, `build_failed`,
+`inline_test_modified`, `unsafe_added`, `new_test_file`, `missing_test_file`,
+`symlink_swap`, `frozen_store_tampered`, `baseline_tampered`, `build_failed`,
 `tests_failed`, `timeout`, `stop_forced`.
 
 `benchmarks` has one row per measured benchmark and is present whenever the
@@ -273,13 +274,15 @@ line.
 The columns the human sees are:
 
 ```
-commit	score	best_bench_delta	status	description
+commit	score	best_bench_delta	status	description	version
 ```
 
-(There is no allocation column here — criterion measures wall-clock time
-only, and this harness has no way to count allocations without instrumenting
-the very code it measures. If you're looking for an allocation-count lead,
-see the idea bank below: it deliberately does not offer one.)
+(The last column is the `rustperf` version that wrote the row, filled in by
+the harness — the human needs it when a log spans a tool upgrade. There is
+no allocation column here — criterion measures wall-clock time only, and this
+harness has no way to count allocations without instrumenting the very code
+it measures. If you're looking for an allocation-count lead, see the idea
+bank below: it deliberately does not offer one.)
 
 `commit`, `score`, `best_bench_delta`, and `status` are filled in by the
 harness from the verdict — you do not control them. The one column that is
@@ -338,6 +341,29 @@ Search rather than flail. Start from `rustperf profile`, not from a guess.
 - **Algorithmic replacement.** The largest wins are usually not micro-tuning:
   a quadratic string build, a linear scan that could be a lookup, work repeated
   per iteration that could be hoisted.
+- **Newer std APIs that remove work** — only when the repository's declared
+  MSRV and CI toolchain already allow Rust 1.100; check `rust-version` before
+  proposing one, or the experiment buys speed by breaking the supported
+  compiler:
+  - `str::trim_prefix` / `str::trim_suffix` (and the same on `[T]`, plus
+    `Path::trim_prefix`) replace `strip_prefix(..).map(..).unwrap_or(..)`
+    chains with one call and no intermediate `Option`.
+  - `Vec::from_fn(n, |i| ..)` builds the vector in one pass instead of
+    `vec![placeholder; n]` followed by overwriting every element.
+  - `bool::toggle()` reads better than `flag = !flag` in a state machine;
+    it is not a speed trick.
+  - `Box::map` / `Arc::map` / `Rc::map` and `Box::take` transform or move the
+    inner value without rebuilding the pointer. Whether the allocation is
+    actually saved depends on the layouts; confirm it with the clock rather
+    than assuming.
+  - `Result<T, !>` on an internal API says the error branch cannot happen;
+    the compiler also drops it from codegen.
+- **Arena or custom allocator for one hot phase** (`std::alloc::Allocator`
+  with `Vec::with_capacity_in` / `Box::new_in`, stable in Rust 1.100). A bump
+  arena turns thousands of allocations into one and frees them all at once.
+  Only worth it when the borrow checker can prove the arena outlives every
+  use and the phase ends where the arena does; the clock has to show the win,
+  because an arena that outlives its phase is a leak with a nicer name.
 
 Two notes specific to this harness. There are **no allocation counts** —
 criterion measures time only — so an allocation hypothesis has to be confirmed

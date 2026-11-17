@@ -1,5 +1,5 @@
 use crate::args::Args;
-use rustperf_core::{config, discover, freeze, gitx, results, scope, state};
+use rustperf_core::{config, discover, freeze, gitx, results, runner, scope, state, stats};
 use std::path::Path;
 
 pub fn run(argv: &[String]) -> i32 {
@@ -128,9 +128,23 @@ fn freeze_and_pin(
         locked_files.insert(rel.clone(), freeze::sha256_file(&root.join(&rel))?);
     }
 
+    // Hash gitignored sources outside the scope: git cannot report edits to
+    // them, so `eval` compares hashes of what is on disk instead.
+    let mut ignored_sources = std::collections::BTreeMap::new();
+    for rel in discover::ignored_sources_outside_scope(root, &matcher)? {
+        ignored_sources.insert(rel.clone(), freeze::sha256_file(&root.join(&rel))?);
+    }
+
     // Pin the measurement worktree.
     let worktree = dir.join(state::WORKTREE_NAME);
     gitx::add_worktree(root, &worktree, &commit)?;
+
+    // Warm the worktree with the release build `eval` would otherwise pay
+    // for on its very first measurement. Environment trouble here must not
+    // sink `baseline`: `eval` reports a build that does not compile far more
+    // precisely (and without rolling back a perfectly good baseline), so a
+    // failed warm-up only adds a warning to the output below.
+    let warm = warm_note(&warm_worktree(&worktree, cfg)?);
 
     let record = state::Baseline {
         tag: tag.to_string(),
@@ -142,18 +156,132 @@ fn freeze_and_pin(
         bench_targets: cfg.bench_targets.clone(),
         config_sha256: freeze::sha256_file(cfg_path)?,
         locked_files,
+        ignored_sources: Some(ignored_sources),
     };
     record.save(&dir.join(state::BASELINE_FILE))?;
+
+    let warning = keep_reachability_warning(cfg.count, record.benchmarks.len())
+        .map(|w| format!("\nwarning        {w}\n"))
+        .unwrap_or_default();
 
     Ok(format!(
         "run tag        {tag}\nbranch         {branch}  (checked out)\nbaseline       \
          {commit}\nfrozen         {} test file(s), {} source file(s) hashed for inline \
-         tests\nworktree       {}\nbenchmarks     {}\n\nStart your agent in this repository \
-         and point it at program.md.\n",
+         tests\nworktree       {}{warm}\nbenchmarks     {}\n{warning}\nStart your agent in this \
+         repository and point it at program.md.\n",
         manifest.files.len(),
         manifest.inline.len(),
         worktree.display(),
         record.benchmarks.join(", ")
+    ))
+}
+
+/// Lines of a failed warm-up build's output `baseline` repeats. The real
+/// cause is at the bottom of cargo's diagnostics; a whole failed build log is
+/// not something anyone wants echoed back at them.
+const WARM_TAIL_LINES: usize = 5;
+
+/// The 15 columns `baseline`'s `label value` lines spend on their label, so
+/// the lines of a multi-line warning start under its body rather than under
+/// its label.
+const WARNING_INDENT: &str = "               ";
+
+/// Runs, inside the freshly pinned worktree, the release build `eval` would
+/// otherwise pay for on its first measurement.
+///
+/// A warm-up can fail in three ways — cargo exits non-zero, the config's
+/// timeout expires, or cargo cannot be started at all — and [`warm_note`]
+/// reports all three identically. The last one has no streams of its own, so
+/// it is folded into an [`runner::Output`] with the error where cargo's
+/// diagnostics would have been, keeping the formatter total and testable
+/// without ever invoking cargo.
+fn warm_worktree(worktree: &Path, cfg: &config::Config) -> Result<runner::Output, String> {
+    const ARGS: [&str; 4] = ["build", "--release", "--all-targets", "--workspace"];
+    let r = runner::Runner::new(worktree, cfg.timeout_duration()?);
+    match r.cargo(&ARGS, None) {
+        Ok(out) => Ok(out),
+        Err(e) => Ok(runner::Output {
+            args: ARGS.iter().map(|a| a.to_string()).collect(),
+            stdout: Vec::new(),
+            stderr: e.into_bytes(),
+            // `cargo` reports -1 for a child that never produced an exit
+            // status; the formatter treats any negative code as such.
+            exit_code: -1,
+            timed_out: false,
+            cancelled: false,
+            duration: std::time::Duration::ZERO,
+        }),
+    }
+}
+
+/// What the `worktree` line says about the warm-up build: `  (warm: release
+/// build ok)` appended to the line itself on success, or — after any failure
+/// — a `warning` block appended below it, naming the cold first `eval` and
+/// the last few lines of the build's own output.
+///
+/// A failed warm-up is deliberately not an error: `baseline` must not refuse
+/// to pin a run because the build environment is broken, and `eval` already
+/// reports a build that does not compile. The returned text is written
+/// verbatim after the worktree path, so a failure block starts with a newline
+/// (separating it from that path) and ends with one (separating it from the
+/// `benchmarks` line that follows).
+fn warm_note(out: &runner::Output) -> String {
+    if out.ok() && !out.cancelled {
+        return "  (warm: release build ok)".to_string();
+    }
+    let how = if out.cancelled {
+        "was cancelled".to_string()
+    } else if out.timed_out {
+        format!("timed out after {}s", out.duration.as_secs())
+    } else if out.exit_code < 0 {
+        "did not exit cleanly".to_string()
+    } else {
+        format!("exited with status {}", out.exit_code)
+    };
+    let mut text = format!(
+        "\nwarning        the baseline worktree was not warmed: cargo build --release \
+         --all-targets --workspace {how} — the first eval will pay for a cold release build\n"
+    );
+    for line in out.tail(WARM_TAIL_LINES).lines() {
+        // Blank diagnostic lines (cargo emits them between notes) must not
+        // turn into 15 columns of trailing whitespace.
+        let line = line.trim_end();
+        if line.is_empty() {
+            text.push('\n');
+        } else {
+            text.push_str(WARNING_INDENT);
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    text
+}
+
+/// Raw significance level `eval` tests every benchmark at before correcting.
+const ALPHA: f64 = 0.05;
+
+/// Says so when this run could never produce a KEEP.
+///
+/// `eval` corrects the threshold to `alpha / k` for `k` benchmarks, and the
+/// U test cannot return a p-value below a floor set by the rounds per side.
+/// `count` and `k` are fixed by the baseline's config hash, so the run would
+/// discard every experiment for the whole night; the verdict already warns
+/// about it, but only after a measurement was spent to find out.
+fn keep_reachability_warning(count: usize, k: usize) -> Option<String> {
+    let k = k.max(1);
+    let corrected = ALPHA / k as f64;
+    if stats::min_achievable_p(count, count) < corrected {
+        return None;
+    }
+    let advice = match stats::count_for_alpha(corrected) {
+        Some(need) => format!("raise count to at least {need} in {}", config::CONFIG_PATH),
+        None => "measure fewer benchmarks (list fewer in the config)".to_string(),
+    };
+    Some(format!(
+        "no KEEP can be reached: {k} benchmark(s) correct the threshold to {corrected:.5}, \
+         but count = {count} cannot produce a p-value below {:.5}. {advice}, then start a \
+         new run.",
+        stats::min_achievable_p(count, count)
     ))
 }
 
@@ -224,4 +352,101 @@ fn now_utc() -> String {
         (rem % 3600) / 60,
         rem % 60
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reachable_threshold_gives_no_warning() {
+        assert_eq!(keep_reachability_warning(10, 1), None);
+    }
+
+    #[test]
+    fn too_many_benchmarks_for_the_count_is_reported_with_a_fix() {
+        let w = keep_reachability_warning(5, 30).expect("unreachable");
+        assert!(w.contains("30 benchmark"), "{w}");
+        assert!(w.contains("no KEEP can be reached"), "{w}");
+    }
+
+    fn build(stderr: &str, exit_code: i32, timed_out: bool) -> runner::Output {
+        runner::Output {
+            args: vec!["build".to_string(), "--release".to_string()],
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+            exit_code,
+            timed_out,
+            cancelled: false,
+            duration: std::time::Duration::from_secs(7),
+        }
+    }
+
+    #[test]
+    fn a_warm_worktree_says_so_on_the_worktree_line() {
+        assert_eq!(
+            warm_note(&build("", 0, false)),
+            "  (warm: release build ok)"
+        );
+    }
+
+    #[test]
+    fn a_failed_warm_build_warns_with_the_stderr_tail() {
+        let note = warm_note(&build(
+            "   Compiling demo v0.1.0\nerror[E0432]: unresolved import `nope`\n\
+             error: could not compile `demo` (lib) due to 1 previous error\n",
+            101,
+            false,
+        ));
+        assert!(note.starts_with("\nwarning        "), "{note}");
+        assert!(
+            note.contains("first eval will pay for a cold release build"),
+            "{note}"
+        );
+        assert!(note.contains("status 101"), "{note}");
+        assert!(note.contains("unresolved import `nope`"), "{note}");
+        // The block starts on its own line, after the worktree path, and ends
+        // with one so the following `benchmarks` line stays separated.
+        assert!(note.ends_with('\n'), "{note}");
+    }
+
+    #[test]
+    fn a_timed_out_warm_build_is_a_warning_not_an_error() {
+        let note = warm_note(&build("", -1, true));
+        assert!(note.contains("timed out after 7s"), "{note}");
+        assert!(
+            note.contains("first eval will pay for a cold release build"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn a_warm_build_that_could_not_be_started_is_reported_the_same_way() {
+        let note = warm_note(&build(
+            "run cargo build: No such file or directory",
+            -1,
+            false,
+        ));
+        assert!(note.contains("cold release build"), "{note}");
+        assert!(note.contains("No such file or directory"), "{note}");
+    }
+
+    #[test]
+    fn only_the_tail_of_a_failed_build_is_repeated() {
+        // Ten stderr lines, one of them blank like cargo's own diagnostics,
+        // of which only the last five belong in the warning.
+        let mut stderr = String::new();
+        for i in 1..=9 {
+            if i == 7 {
+                stderr.push('\n');
+            }
+            stderr.push_str(&format!("error {i}\n"));
+        }
+        let note = warm_note(&build(&stderr, 101, false));
+        assert!(!note.contains("error 5"), "{note}");
+        assert!(note.contains("error 9"), "{note}");
+        // The blank diagnostic line is echoed as an empty line, not as a run
+        // of trailing whitespace.
+        assert!(note.lines().all(|l| !l.ends_with(' ')), "{note:?}");
+    }
 }

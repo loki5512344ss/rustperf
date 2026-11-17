@@ -129,3 +129,24 @@ fn stop_force_clears_a_stale_eval_pid_with_nothing_to_signal() {
         "a stale pid file must be cleared, not left behind"
     );
 }
+
+#[test]
+fn status_json_reports_the_run_as_one_object_and_writes_nothing() {
+    let repo = ready("t1");
+    let before = common::tree_snapshot(repo.path());
+    let out = common::run_cli(&repo, &["status", "--json"]);
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");
+    assert_eq!(v["tag"], "t1");
+    assert_eq!(v["branch"], "rustperf/t1");
+    assert_eq!(v["branch_checked_out"], true);
+    assert_eq!(v["stop_requested"], false);
+    assert_eq!(v["worktree_exists"], true);
+    assert_eq!(v["baseline_commit"], v["measure_commit"]);
+    assert_eq!(common::tree_snapshot(repo.path()), before);
+
+    assert!(common::run_cli(&repo, &["stop"]).status.success());
+    let out = common::run_cli(&repo, &["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["stop_requested"], true);
+}

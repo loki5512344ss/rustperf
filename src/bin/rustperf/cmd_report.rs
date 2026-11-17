@@ -5,7 +5,7 @@ use rustperf_core::gitx;
 use rustperf_core::results::{self, Row};
 
 pub fn run(argv: &[String]) -> i32 {
-    let args = match Args::parse(argv, &[("C", true)]) {
+    let args = match Args::parse(argv, &[("C", true), ("json", false)]) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
@@ -27,7 +27,56 @@ pub fn run(argv: &[String]) -> i32 {
 fn report(args: &Args) -> Result<String, String> {
     let root = gitx::root(&args.dir())?;
     let rows = results::load(&root.join(results::RESULTS_PATH))?;
+    if args.flag("json") {
+        let mut text = serde_json::to_string_pretty(&report_json(&rows))
+            .map_err(|e| format!("encode report: {e}"))?;
+        text.push('\n');
+        return Ok(text);
+    }
     Ok(format_report(&rows))
+}
+
+/// The same summary as [`format_report`], as one JSON object, for a caller
+/// that would otherwise parse the text. Same arithmetic: the cumulative score
+/// is the product of every kept row's score.
+fn report_json(rows: &[Row]) -> serde_json::Value {
+    let count = |status: &str| rows.iter().filter(|r| r.status == status).count();
+    let kept: Vec<&Row> = rows.iter().filter(|r| r.status == "KEEP").collect();
+    let cumulative: f64 = kept.iter().map(|r| r.score).product();
+    let mut wins = kept.clone();
+    wins.sort_by(|a, b| {
+        a.best_bench_delta
+            .partial_cmp(&b.best_bench_delta)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let wins: Vec<serde_json::Value> = wins
+        .iter()
+        .take(5)
+        .map(|r| {
+            serde_json::json!({
+                "commit": r.commit,
+                "description": r.description,
+                "score": r.score,
+                "best_bench_delta": r.best_bench_delta,
+            })
+        })
+        .collect();
+    let mut out = serde_json::json!({
+        "experiments": rows.len(),
+        "keep": count("KEEP"),
+        "discard": count("DISCARD"),
+        "fail": count("FAIL"),
+        "crash": count("CRASH"),
+        "largest_wins": wins,
+    });
+    if !kept.is_empty() {
+        out["cumulative_score"] = serde_json::json!(cumulative);
+        out["cumulative_speedup_pct"] = serde_json::json!((1.0 - cumulative) * 100.0);
+        if cumulative > 0.0 {
+            out["speedup_multiplier"] = serde_json::json!(1.0 / cumulative);
+        }
+    }
+    out
 }
 
 /// Renders the summary. The cumulative speedup is the PRODUCT of every kept
@@ -126,6 +175,7 @@ mod tests {
             best_bench_delta,
             status: status.into(),
             description: desc.into(),
+            version: "0.3.0".into(),
         }
     }
 
@@ -149,6 +199,29 @@ mod tests {
         // 0.8 * 0.5 = 0.40, the PRODUCT rather than the latest kept score
         // (0.5) alone.
         assert!(text.contains("0.40"), "{text}");
+    }
+
+    #[test]
+    fn json_report_matches_the_text_arithmetic() {
+        let rows = vec![
+            row("KEEP", 0.8, -20.0, "a"),
+            row("KEEP", 0.5, -50.0, "b"),
+            row("DISCARD", 1.0, 0.0, "c"),
+        ];
+        let v = report_json(&rows);
+        assert_eq!(v["experiments"], 3);
+        assert_eq!(v["keep"], 2);
+        assert_eq!(v["discard"], 1);
+        assert!((v["cumulative_score"].as_f64().unwrap() - 0.4).abs() < 1e-12);
+        assert!((v["speedup_multiplier"].as_f64().unwrap() - 2.5).abs() < 1e-12);
+        assert_eq!(v["largest_wins"][0]["description"], "b");
+    }
+
+    #[test]
+    fn json_report_with_nothing_kept_omits_the_cumulative_fields() {
+        let v = report_json(&[row("DISCARD", 1.0, 0.0, "c")]);
+        assert!(v.get("cumulative_score").is_none());
+        assert_eq!(v["keep"], 0);
     }
 
     #[test]

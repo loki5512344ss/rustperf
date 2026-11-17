@@ -15,14 +15,29 @@
 //!
 //! On unix, `--force` sends a real `SIGTERM` to a verified-LIVE `eval`
 //! process (see `rustperf_core::state::eval_running`, which tells a live
-//! claim from a pid file a crashed eval left behind) and waits briefly for
-//! it to exit on its own — `eval`'s own signal handler sets
+//! claim from a pid file a crashed eval left behind) and waits `FORCE_GRACE`
+//! for it to exit on its own — `eval`'s own signal handler sets
 //! `state::CANCEL_REQUESTED`, which the pipeline and `Runner::cargo` check
 //! between gates and between measurement rounds, so the process gets a
 //! chance to record `ABORTED`/`stop_forced` and tear down its own benchmark
-//! subprocess cleanly. Windows has no such polite half — see [`terminate`]
-//! — so there `--force` ends the process outright, and the killed `eval`
-//! never gets to record what it abandoned.
+//! subprocess cleanly.
+//!
+//! If the claim is still held after that grace period, `--force` escalates
+//! instead of giving up — see [`escalate`]. A polite `SIGTERM` only helps an
+//! `eval` that reaches a poll tick; one wedged inside a syscall it cannot
+//! leave (a stuck `cargo` waiting on a lock, a benchmark spinning in a
+//! build script) would otherwise leave its benchmark running for as long as
+//! the human leaves the machine alone. `eval`'s benchmark child is its own
+//! process-group leader, and `Runner::cargo` records that pid in a temp file
+//! for exactly this case, so the escalation SIGKILLs the whole recorded
+//! group first (taking the grandchild with it), then SIGKILLs `eval` itself,
+//! then clears the claim a `SIGKILL`ed process can no longer release. That
+//! experiment is then gone, not scored: an escalated stop throws the
+//! measurement away, which is what the human asked for.
+//!
+//! Windows has no such polite half — see [`terminate`] — so there `--force`
+//! ends the process outright from the start, and the killed `eval` never
+//! gets to record what it abandoned.
 
 use crate::args::Args;
 use rustperf_core::{gitx, state};
@@ -30,10 +45,11 @@ use std::path::Path;
 use std::time::Duration;
 
 /// How long `--force` waits for a signalled `eval` to release its claim
-/// before giving up and reporting the repository state regardless. Not an
-/// escalation to a harder kill signal — see the module doc comment on why a
-/// stuck `eval` is a courtesy wait, not something this command tries to
-/// clean up further by force.
+/// before escalating to `SIGKILL` — first its recorded benchmark process
+/// group, then `eval` itself; see [`escalate`]. Long enough for a cooperative
+/// `eval` to finish the abort it was asked for (record the abandoned
+/// experiment, kill its own benchmark, drop the claim), short enough that a
+/// human who cannot wait is not left watching a frozen process.
 const FORCE_GRACE: Duration = Duration::from_secs(10);
 const FORCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -118,7 +134,8 @@ fn stop(args: &Args) -> Result<String, String> {
 }
 
 /// Signals a live `eval`, if one holds the run's claim, and reports what
-/// happened. See [`terminate`] for the unix/Windows split.
+/// happened. See [`terminate`] for the unix/Windows split and [`escalate`]
+/// for what happens when the polite signal is not enough.
 fn force_signal(dir: &Path) -> String {
     let live = match state::eval_running(dir) {
         Ok(p) => p,
@@ -147,11 +164,7 @@ fn force_signal(dir: &Path) -> String {
         if wait_for_release(dir, FORCE_GRACE) {
             out.push_str("eval exited\n");
         } else {
-            out.push_str(&format!(
-                "eval did not exit within {:?}; it may still be tearing down its benchmark \
-                 subprocess — check again with `rustperf status`\n",
-                FORCE_GRACE
-            ));
+            out.push_str(&escalate(pid, dir));
         }
     } else {
         // TerminateProcess is immediate and gives the target no chance to
@@ -161,6 +174,57 @@ fn force_signal(dir: &Path) -> String {
         out.push_str("eval terminated (no graceful shutdown on this platform)\n");
         let _ = state::clear_eval_pid(dir);
     }
+    out
+}
+
+/// What `--force` does when the polite half has run out of time: kill the
+/// benchmark group `eval` recorded, kill `eval`, and clear the claim the
+/// killed process can no longer release itself.
+///
+/// The order matters. The benchmark goes first, because the record naming
+/// its group is this command's only handle on that tree, and it is used
+/// before anything else can change state. `SIGKILL` is the only signal that
+/// reaches a process stuck somewhere it cannot leave; it also cannot be
+/// caught, so `eval` records nothing about the experiment — which is why the
+/// report says so out loud rather than implying a verdict exists.
+fn escalate(pid: u32, dir: &Path) -> String {
+    let mut out = format!(
+        "eval did not release its claim within {:?}; escalating to SIGKILL\n",
+        FORCE_GRACE
+    );
+
+    match rustperf_core::runner::kill_recorded_tree(pid) {
+        Ok(true) => out.push_str(
+            "killed the benchmark process group eval was running — the benchmark is gone\n",
+        ),
+        Ok(false) => out.push_str(
+            "no benchmark pid was recorded for that eval (it had no command running, or the \
+             record was already cleared) — nothing extra to kill\n",
+        ),
+        Err(e) => out.push_str(&format!(
+            "could not kill the recorded benchmark tree: {e}\n"
+        )),
+    }
+
+    if kill_forced(pid) {
+        out.push_str(&format!("killed eval (pid {pid}) with SIGKILL\n"));
+    } else {
+        out.push_str(&format!(
+            "could not SIGKILL eval (pid {pid}); it may have exited between the check and the \
+             signal\n"
+        ));
+    }
+
+    // A process killed by SIGKILL runs no destructor, so `EvalClaim::drop` —
+    // the only thing that unlocks and removes `eval.pid` — never runs. Left
+    // in place, that file would keep claiming a live eval, and the next
+    // `eval` would refuse to start because of it.
+    match state::clear_eval_pid(dir) {
+        Ok(()) => out.push_str("cleared the eval claim it could not release itself\n"),
+        Err(e) => out.push_str(&format!("could not clear the eval claim: {e}\n")),
+    }
+
+    out.push_str("the experiment was killed, not scored: nothing about it was recorded\n");
     out
 }
 
@@ -191,6 +255,25 @@ fn terminate(pid: u32) -> bool {
     // SAFETY: sends a real signal to a pid `state::eval_running` just
     // confirmed holds this run's live claim.
     unsafe { libc::kill(pid as i32, libc::SIGTERM) == 0 }
+}
+
+/// The last resort on unix: `SIGKILL` cannot be caught, so the target gets no
+/// chance to record anything or to release its claim — see [`escalate`],
+/// which clears that claim afterward.
+#[cfg(unix)]
+fn kill_forced(pid: u32) -> bool {
+    // SAFETY: sends a real signal to a pid `state::eval_running` confirmed
+    // held this run's live claim, after the whole grace period for it to
+    // exit on its own has already elapsed.
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) == 0 }
+}
+
+/// Nothing to escalate to on platforms that have no graceful half: `--force`
+/// there already ends the process outright on the first try (see
+/// [`terminate`]).
+#[cfg(not(unix))]
+fn kill_forced(_pid: u32) -> bool {
+    false
 }
 
 /// Windows has no `SIGTERM` a process can catch and act on mid-benchmark, so

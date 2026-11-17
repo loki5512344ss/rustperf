@@ -147,7 +147,10 @@ pub fn eval(
         {
             continue; // harness output, plus the config, integrity-checked below
         }
-        if rel.starts_with("tests/") || rel.starts_with("benches/") {
+        if rel.starts_with("tests/")
+            || rel.starts_with("benches/")
+            || discover::is_test_or_bench_path(rel)
+        {
             continue; // handled by restore, not by the scope gate
         }
         if !matcher.matches(rel) {
@@ -215,6 +218,48 @@ pub fn eval(
         ));
     }
 
+    // 2c. Gitignored sources outside the scope, same reasoning as 2b: git
+    //     cannot report an edit to a file it ignores, so compare hashes of
+    //     what is on disk with what baseline recorded. Skipped for a baseline
+    //     recorded before the field existed.
+    if let Some(recorded) = &o.baseline.ignored_sources {
+        let current: std::collections::BTreeMap<String, String> =
+            discover::ignored_sources_outside_scope(&o.root, &matcher)?
+                .into_iter()
+                .map(|rel| {
+                    let hash = freeze::sha256_file(&o.root.join(&rel))?;
+                    Ok::<_, String>((rel, hash))
+                })
+                .collect::<Result<_, String>>()?;
+        if &current != recorded {
+            let mut details: Vec<String> = Vec::new();
+            for (rel, hash) in &current {
+                match recorded.get(rel) {
+                    None => details.push(format!("{rel} added")),
+                    Some(h) if h != hash => details.push(format!("{rel} modified")),
+                    _ => {}
+                }
+            }
+            for rel in recorded.keys() {
+                if !current.contains_key(rel) {
+                    details.push(format!("{rel} removed"));
+                }
+            }
+            return Ok((
+                verdict::gate(
+                    Status::Fail,
+                    Reason::ScopeViolation,
+                    format!(
+                        "gitignored source file(s) outside the scope changed since baseline — \
+                         git does not report these, so they are compared by hash: {}",
+                        details.join("; ")
+                    ),
+                ),
+                None,
+            ));
+        }
+    }
+
     // 3. Config integrity. config.yaml lives in the repo because humans own
     //    it, which means the agent can reach it; raising max_regress_pct or
     //    dropping a benchmark would defeat the guard.
@@ -255,7 +300,7 @@ pub fn eval(
         let mut base_sources: Vec<(String, String)> = Vec::new();
         let mut cand_sources: Vec<(String, String)> = Vec::new();
         for rel in &scan_paths {
-            if !rel.ends_with(".rs") || rel.starts_with("tests/") || rel.starts_with("benches/") {
+            if !rel.ends_with(".rs") || discover::is_test_or_bench_path(rel) {
                 continue;
             }
             if let Some(text) = gitx::file_at(&o.root, &o.baseline.commit, rel)? {
@@ -508,6 +553,27 @@ pub fn eval(
         ));
     }
 
+    // 9b. The same worktree must also be CLEAN. HEAD alone cannot see an
+    //     uncommitted edit, and an edit that makes the baseline slower is the
+    //     cheapest way to a KEEP. `target/` is exempt: building there is the
+    //     worktree's job.
+    let dirty = gitx::dirty_paths(&worktree)?;
+    if !dirty.is_empty() {
+        return Ok((
+            verdict::gate(
+                Status::Fail,
+                Reason::BaselineTampered,
+                format!(
+                    "pinned baseline worktree has uncommitted changes: {dirty:?} — it no longer \
+                     matches commit {} and measuring against it would not be a fair comparison. \
+                     Start a fresh run with 'rustperf baseline --tag <tag>'.",
+                    o.baseline.measure_commit
+                ),
+            ),
+            None,
+        ));
+    }
+
     // 10. Measure, interleaved against the pinned worktree.
     let opts = measure::Options {
         base_dir: worktree,
@@ -663,6 +729,7 @@ mod tests {
                 bench_targets: Vec::new(),
                 config_sha256: "0".repeat(64),
                 locked_files: std::collections::BTreeMap::new(),
+                ignored_sources: None,
             },
         };
 

@@ -1,6 +1,6 @@
 # План доработок форка (2026-11-12)
 
-Ветка: `fork/harness-gates-and-catalog`. Статусы обновляются по мере работы:
+Работа велась в ветке `fork/harness-gates-and-catalog`, затем влита в `main`. Статусы обновляются по мере работы:
 `[ ]` не начато, `[~]` в работе, `[x]` сделано и проверено.
 
 Правило для всего плана: число без команды, которая его дала, не записывается.
@@ -90,3 +90,72 @@
 | D1–D4 | субагент (справочники и гайд) |
 
 Файлы между исполнителями не пересекаются. Коммиты — только по команде владельца.
+
+## E. Харнесс: закрытие известных дыр (2026-11-15)
+
+- [x] E1. Заморозка `tests/` и `benches/` у каждого пакета (любой каталог с
+  `Cargo.toml`), а не только у корня workspace. Проверено: юнит-тест
+  `frozen_test_files_reach_workspace_members_at_any_depth`.
+- [x] E2. Baseline-worktree должен быть чистым, а не только стоять на нужном
+  коммите: `FAIL(baseline_tampered)`. Проверено: интеграционный тест
+  `an_uncommitted_edit_in_the_baseline_worktree_is_detected`.
+- [x] E3. Gitignored `.rs` вне scope хешируются на baseline и сверяются при
+  каждом `eval`. Проверено: `editing_a_gitignored_source_outside_the_scope_fails`.
+- [x] E4. Защита от регрессий срабатывает и на медианном замедлении от 50 % при
+  любом `p`. Проверено: два юнит-теста в `verdict.rs`.
+- [x] E5. `baseline` предупреждает, если `count` и число бенчмарков делают KEEP
+  недостижимым. Проверено: два юнит-теста в `cmd_baseline.rs`.
+- [x] E6. `status --json`, `report --json`. Проверено: по интеграционному тесту.
+- [ ] E7. Не сделано: гейты clippy и Miri, метрика аллокаций, закрытие
+  оставшихся обходов unsafe-гейта (существующий unsafe-макрос, не-`.rs`
+  include, `build.rs`). Причины и варианты — в `docs/fork-notes.md`.
+
+## F. Дешёвый батч по итогам Rust 1.100 (2026-11-17)
+
+Основание: `~/Downloads/rust-1.100-changelog-rustperf.md` §5.9–5.10 и
+`videoplayback.txt`. Крупные пункты (PGO-режим, телеметрия аллокаций,
+лид-детектор) отложены: они меняют контракт `eval --json`.
+
+Правила батча: один агент — одна задача; файлы задач не пересекаются;
+агент не коммитит и не правит README/`templates/program.md`/этот план
+(их сводит основной агент); новые API Rust 1.100 не использовать, пока
+не решено поднимать MSRV с 1.85.
+
+- [x] F1. `baseline` прогревает pinned worktree: после `gitx::add_worktree`
+  выполнить `cargo build --release --all-targets` в worktree с таймаутом из
+  конфига. Провал прогрева — предупреждение, не отказ: `baseline` не должен
+  падать из-за окружения, `eval` всё равно сообщит о сломанной сборке.
+  Файлы: `src/bin/rustperf/cmd_baseline.rs` (+ тесты там же).
+- [x] F2. `doctor`: две новые проверки. (а) `dependency cooldown` — задан ли
+  `[registry] global-min-publish-age` в `.cargo/config.toml` репозитория или
+  в конфиге `CARGO_HOME`/`~/.cargo`; отсутствие — `warn` с предложением
+  `3 days`. (б) `toolchain age` — по `rustc -Vv` (`release`, `commit-date`):
+  свежее 7 дней — `warn` про свежую кодогенерацию; nightly — подсказка про
+  `--jobs-frontend`. Разбор вынесен в чистые функции, тесты не запускают
+  `rustc`. Файлы: `src/doctor.rs`.
+- [x] F3. Колонка `version` в `results.tsv`: `HEADER` получает шестое поле,
+  `Row` — `version: String`. `load` принимает и 5 полей (старые логи,
+  `version` пустой), и 6; `append` пишет 6. `eval` пишет версию бинарника.
+  Файлы: `src/results.rs`, `src/bin/rustperf/cmd_eval.rs` (+ тесты).
+- [x] F4. `stop --force`: после `FORCE_GRACE` без освобождения claim —
+  эскалация. `Runner` записывает pid запущенной команды (групповой лидер,
+  см. `procgroup_unix::configure`) в файл в `std::env::temp_dir()`, имя
+  содержит pid самого `eval`; после `wait` — удаляет. `stop --force` при
+  таймауте шлёт `SIGKILL` в записанную группу, затем в сам `eval`, и честно
+  очищает claim. Только unix; на прочих платформах поведение не меняется.
+  Проверяется юнит-тестами на путь/разбор; живой «зависший eval» в CI не
+  воспроизводится — это признаётся в отчёте.
+  Файлы: `src/runner.rs`, `src/procgroup_unix.rs`, `src/procgroup_other.rs`,
+  `src/state.rs` (или новый маленький модуль), `src/bin/rustperf/cmd_stop.rs`.
+- [x] F5. CI: недельный `schedule` (cron) + `workflow_dispatch`, отдельная
+  job на ubuntu, которая гоняет 4 `#[ignore]`-теста:
+  `cargo test --test cmd_eval -- --ignored`. Обычные push/PR job не меняются.
+  Файлы: `.github/workflows/ci.yml`.
+- [x] F6. Банк идей `templates/program.md`: добавить проверенные на 1.100.0
+  API (`trim_prefix`/`trim_suffix` для `str`/`[T]`/`Path`, `Vec::from_fn`,
+  `bool::toggle`, `Box::map`/`Arc::map`, `Result<T, !>`), с оговорками:
+  MSRV репозитория, арена на `Allocator` — только с замером и с временем
+  жизни, покрывающим все использования. Владелец: основной агент.
+- [x] F7. Свести доки: README (ограничения, fork changes, число тестов),
+  `docs/fork-notes.md`, `templates/program.md` (колонки `results.tsv`).
+  Владелец: основной агент.

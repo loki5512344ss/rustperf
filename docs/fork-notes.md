@@ -38,6 +38,36 @@ untouched.
 | per-benchmark rows | `src/bin/rustperf/cmd_eval.rs` | `eval --json` gains `benchmarks` (name, medians, `pct_change`, `p`, thresholds) whenever measurement ran; the text output prints name, medians, `pct_change` and `p`, but not `keep_threshold_p`/`n_base`/`n_cand` |
 | `gitx::file_at` | `src/gitx.rs` | reads a file as of a commit, for the gate |
 
+Added on 2026-11-15 (all covered by tests, see `docs/fork-plan.md` section E):
+
+| Change | Where | Effect |
+|---|---|---|
+| member-crate tests frozen | `discover::frozen_test_files` | every package's `tests/` and `benches/` are snapshotted and restored, not only the root's |
+| clean baseline worktree | `pipeline.rs` gate 9b, `gitx::dirty_paths` | uncommitted edits in the pinned worktree are `FAIL(baseline_tampered)` |
+| gitignored sources | `pipeline.rs` gate 2c, `Baseline.ignored_sources` | hashed at baseline, compared each `eval`; `Option` so older baselines skip it |
+| large-regression floor | `verdict::LARGE_REGRESSION_PCT` | a 50 % median slowdown trips the guard whatever its p-value |
+| unreachable-KEEP warning | `cmd_baseline.rs` | printed at `baseline`, not discovered after a measurement |
+| `--json` | `cmd_status.rs`, `cmd_report.rs` | same facts as the text, one object |
+
+Not done, and why: a clippy gate needs a baseline-relative rule (the baseline
+may already warn) and so two extra lint runs per eval; a Miri gate needs
+nightly and is slow enough to dominate the loop, so it wants an opt-in config
+field and a time budget; an allocation metric needs an allocator hook inside
+the user's benchmark, which the harness does not control. The remaining
+unsafe-gate bypasses are inherent to a token scan.
+
+Added on 2026-11-17, from the Rust 1.100 changelog (`docs/fork-plan.md` § F):
+
+| Change | Where | Effect |
+|---|---|---|
+| `version` column | `results::HEADER`, `Row.version`, `cmd_eval.rs` | every row records which `rustperf` wrote it; five-field logs still load, with the field empty |
+| dependency cooldown check | `doctor::dependency_cooldown` | warns when `[registry] global-min-publish-age` is not set in the repo or user Cargo config (RFC 3923, stable in cargo 1.100) |
+| toolchain age check | `doctor::toolchain_age` | warns when the compiler was released less than 7 days ago, and mentions `--jobs-frontend` on nightly |
+| weekly slow tests | `.github/workflows/ci.yml` | `schedule` + `workflow_dispatch` run the four `#[ignore]`d end-to-end tests, which no push/PR job executed |
+| forced-stop escalation | `procgroup_unix.rs`, `runner.rs`, `cmd_stop.rs` | after the 10 s grace, `stop --force` SIGKILLs the benchmark group the eval recorded, then the eval, then clears its claim; the record is a per-eval pid file in the temp dir, written on spawn and removed on every exit path |
+| 1.100 idea bank | `templates/program.md` | `trim_prefix`/`trim_suffix`, `Vec::from_fn`, `bool::toggle`, `Box::map`/`Arc::map`, `Result<T, !>`, arena on `Allocator` — each with the MSRV/lifetime caveat |
+
+
 Why the gate works on tokens and what it cannot see is written at the top of
 `src/unsafe_gate.rs`. Tests: 23 unit tests in that module, 6 gate tests in
 `tests/pipeline_gates.rs`, and the two real-benchmark tests in

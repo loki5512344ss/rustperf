@@ -17,6 +17,24 @@ mod procgroup;
 #[path = "procgroup_other.rs"]
 mod procgroup;
 
+/// SIGKILLs the process group that the `eval` process `eval_pid` most
+/// recently started, if it recorded one, and removes the record.
+///
+/// `eval` runs each `cargo` command as its own process-group leader and
+/// records that pid in a temp file (see the `procgroup` module docs), so a
+/// `stop --force` in another process can take down the benchmark a wedged or
+/// killed `eval` can no longer tear down itself. `Ok(false)` means there was
+/// no record — no command was running, or it was already cleared — which is
+/// not an error.
+///
+/// The record can outlive a crash, so only call this for a pid whose live
+/// claim [`crate::state::eval_running`] has just confirmed; this function
+/// does not check that itself. Always `Ok(false)` on non-unix platforms,
+/// where the process tree is torn down some other way.
+pub fn kill_recorded_tree(eval_pid: u32) -> Result<bool, String> {
+    procgroup::kill_recorded_tree(eval_pid)
+}
+
 /// The most output retained per stream. A chatty test suite must not be able
 /// to exhaust memory, and nothing downstream reads more than the tail.
 pub const CAP_BYTES: usize = 4 * 1024 * 1024;
@@ -151,6 +169,25 @@ impl Runner {
             .spawn()
             .map_err(|e| format!("run cargo {}: {e}", args.join(" ")))?;
 
+        // Recorded first, before the pipes are drained or anything is waited
+        // on: from this instant the command may be the one a wedged `eval`
+        // cannot tear down itself, and `stop --force` reads this pid to
+        // SIGKILL the whole group. Failing to record costs only that
+        // escalation, so it is a warning, never a failed run.
+        let _child_record = match procgroup::record_child(child.id()) {
+            Ok(()) => Some(ChildRecord),
+            Err(e) => {
+                if let Some(log) = log.as_deref_mut() {
+                    let _ = writeln!(
+                        log,
+                        "warning: {e} — 'stop --force' will not be able to kill this \
+                         command's tree"
+                    );
+                }
+                None
+            }
+        };
+
         // Drain both pipes on their own threads: a child that fills a pipe
         // buffer blocks forever if nobody is reading, and the timeout below
         // would never be reached because wait() is what notices it.
@@ -236,9 +273,48 @@ impl Runner {
     }
 }
 
+/// Removes the temp file that names the command currently running.
+///
+/// A guard rather than a call at each exit point, because this file must not
+/// survive a normal wait, a timeout, a cancel, or the `?` on a `try_wait`
+/// error — missing one would leave `stop --force` naming a pid that is no
+/// longer this run's.
+struct ChildRecord;
+
+impl Drop for ChildRecord {
+    fn drop(&mut self) {
+        // Nothing is left to tell the caller here, and a stale record is
+        // harmless: the next spawn truncates it and `kill_recorded_tree`
+        // reports a group that no longer exists as "nothing to kill".
+        let _ = procgroup::clear_child();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes every test in this module that runs a real command. They
+    /// all write and remove the SAME per-process child record (its name is
+    /// keyed by `std::process::id()`, not by the test), so two of them
+    /// running concurrently would let one test's cleanup remove the file
+    /// another is asserting about.
+    static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+    fn spawn_guard() -> std::sync::MutexGuard<'static, ()> {
+        // A poisoned lock protects only `()`: no test can corrupt an
+        // invariant another test depends on, so reusing it keeps one genuine
+        // failure from cascading into every later test as a PoisonError.
+        SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The temp file `Runner::cargo` records its child in, spelled out here
+    /// rather than imported so the test pins the agreed location and name
+    /// (`stop --force` in another process has to find it by the same rule).
+    fn child_record_path() -> PathBuf {
+        std::env::temp_dir().join(format!("rustperf-eval-{}.child", std::process::id()))
+    }
 
     fn runner(timeout: Duration) -> Runner {
         Runner::new(Path::new("."), timeout)
@@ -246,6 +322,7 @@ mod tests {
 
     #[test]
     fn a_successful_command_reports_ok_and_captures_stdout() {
+        let _guard = spawn_guard();
         let out = runner(Duration::from_secs(60))
             .cargo(&["--version"], None)
             .expect("cargo --version");
@@ -263,11 +340,39 @@ mod tests {
     fn a_failing_command_reports_its_exit_code_without_erroring() {
         // A Result error means the harness malfunctioned; a non-zero exit is
         // ordinary data the caller decides about.
+        let _guard = spawn_guard();
         let out = runner(Duration::from_secs(60))
             .cargo(&["--this-flag-does-not-exist"], None)
             .expect("must not be a harness error");
         assert!(!out.ok());
         assert_ne!(out.exit_code, 0);
+    }
+
+    // A record left behind by an `eval` that was killed hard (SIGKILL, the
+    // OOM killer) names a pid from a command that is long gone. The next
+    // command in this process must not inherit it, and must remove it on
+    // every exit path — otherwise `stop --force` would later SIGKILL a group
+    // that has nothing to do with this run.
+    #[test]
+    fn a_completed_command_does_not_leave_a_stale_child_record_behind() {
+        let _guard = spawn_guard();
+        let path = child_record_path();
+        std::fs::write(&path, "999999\n").expect("seed a stale record");
+
+        let out = runner(Duration::from_secs(60))
+            .cargo(&["--version"], None)
+            .expect("cargo --version");
+        assert!(
+            out.ok(),
+            "exit {} timed_out {}",
+            out.exit_code,
+            out.timed_out
+        );
+        assert!(
+            !path.exists(),
+            "{} must not outlive the command it was written for",
+            path.display()
+        );
     }
 
     #[test]
@@ -322,6 +427,7 @@ mod tests {
     fn a_command_exceeding_its_timeout_is_marked_timed_out() {
         // A 0-length timeout guarantees expiry regardless of machine speed,
         // on every platform, so no platform-specific command is needed here.
+        let _guard = spawn_guard();
         let slow = ["--version"];
         let out = runner(Duration::from_millis(0)).cargo(&slow, None).unwrap();
         assert!(

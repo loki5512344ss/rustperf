@@ -187,10 +187,10 @@ count; without it, a longer recording looks like "everything grew".
 Same limits as `perf diff`: colours are sample shares, renamed or inlined
 frames do not match, and a red frame is a place to look, not a proven cause.
 The recordings need stacks (`-g` or `--call-graph dwarf`); without them every
-"stack" is one frame and the graph is just `perf diff` in colour. Here
-call-graph recording is refused (§7) and FlameGraph scripts (and `inferno`)
-are not installed, so the commands above are **not verified on this
-machine**.
+"stack" is one frame and the graph is just `perf diff` in colour. Verified
+2026-11-13 after `kernel.perf_event_paranoid=1`: `perf record -g` → `perf
+script` → `inferno-collapse-perf` → `inferno-diff-folded` ran end to end. With
+the default `perf_event_paranoid=2` call-graph recording is refused (§7).
 
 ## 6. Contention and memory
 

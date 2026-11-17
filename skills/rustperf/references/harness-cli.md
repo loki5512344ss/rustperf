@@ -9,11 +9,11 @@ README. Where README and code disagree, this file follows the code and says so.
 |---|---|---|
 | `init` | `-C`, `--force` | discovers criterion benches, writes `.rustperf/config.yaml` + `program.md`, gitignores run artifacts |
 | `doctor` | `-C` | machine fitness report; **always exits 0**, gates nothing |
-| `baseline --tag <t>` | `-C`, `--tag`, `--force` | creates run branch, freezes `tests/**`+`benches/**`, hashes inline tests + locked files, pins measurement worktree |
+| `baseline --tag <t>` | `-C`, `--tag`, `--force` | creates run branch, freezes every package's `tests/**`+`benches/**`, hashes inline tests, locked files and gitignored out-of-scope sources, pins measurement worktree; warns when `count` and the benchmark count make a KEEP unreachable |
 | `eval` | `-C`, `--json`, `--desc <text>`, `--no-log` | one experiment: gates → build → test → measure → verdict → one `results.tsv` row |
-| `status` | `-C`, `--tag` | read-only run state |
+| `status` | `-C`, `--tag`, `--json` | read-only run state |
 | `stop` | `-C`, `--tag`, `--clear`, `--force` | graceful stop request; `--clear` cancels; `--force` aborts the in-flight eval |
-| `report` | `-C` | counts + cumulative speedup from `results.tsv` |
+| `report` | `-C`, `--json` | counts + cumulative speedup from `results.tsv` |
 | `profile` | `-C`, `--tag` | samply samples of the declared benches; needs `samply` |
 | `version` | — | binary version/commit |
 
@@ -61,10 +61,14 @@ never the agent's to edit, even though it lives in the repo.
 
 1. Stop requested already? → `ABORTED(stop_forced)`, no row.
 2. Scope gate over `git diff + git status` → `FAIL(scope_violation)`.
-   `results.tsv`, `run.log`, config, `tests/**`, `benches/**` are skipped.
+   `results.tsv`, `run.log`, config and `.rs` files under any `tests/` or
+   `benches/` are skipped (restore handles them).
 3. Locked files re-stat'd from disk (`Cargo.toml`, `Cargo.lock`,
    `.cargo/config[.toml]`, `rust-toolchain[.toml]`, any depth) →
    `FAIL(scope_violation)` on add/remove/change.
+3b. Gitignored `.rs` files outside the scope (not under `target/` or a
+   dot-directory) re-hashed from disk against the baseline record →
+   `FAIL(scope_violation)`. Skipped for a baseline recorded before this check.
 4. Config hash → `FAIL(config_changed)`.
 4b. **Unsafe gate (fork addition).** Every changed `.rs` file outside
     `tests/`/`benches/` is tokenized, baseline commit vs disk. An `unsafe`
@@ -80,7 +84,9 @@ never the agent's to edit, even though it lives in the repo.
 8. `cargo build --release --all-targets --workspace` → `CRASH(build_failed|timeout)`.
 9. `cargo test --workspace` in **debug** (overflow checks and `debug_assert!`
    live) → `FAIL(tests_failed|timeout)`.
-10. Baseline worktree `HEAD` == recorded `measure_commit` → `FAIL(baseline_tampered)`.
+10. Baseline worktree `HEAD` == recorded `measure_commit` **and** the worktree
+    has no uncommitted or untracked changes outside `target/` →
+    `FAIL(baseline_tampered)`.
 11. Interleaved measurement, `count` rounds + 1 discarded warmup, side order
     swapped each round.
 12. Score + decision.
@@ -145,14 +151,18 @@ KEEP — the harness warns rather than errors.
 ## 7. `results.tsv`
 
 ```
-commit  score  best_bench_delta  status  description
+commit  score  best_bench_delta  status  description  version
 ```
 
 `score` 4 dp, `best_bench_delta` 2 dp (percent, most-negative delta), status
 one of `KEEP|DISCARD|FAIL|CRASH` (ABORTED never written), description
-whitespace-flattened and truncated to 256 chars. Written by `eval` only,
-`fsync` per row. The loader is strict: one malformed line makes every later
-`eval` exit 2 before doing anything. **Never touch this file.**
+whitespace-flattened and truncated to 256 chars. The last column is the
+`rustperf` version that wrote the row; it is the sixth field where upstream
+has five. Written by `eval` only, `fsync` per row. The loader is strict about
+content — one malformed line makes every later `eval` exit 2 before doing
+anything — but accepts both six-field rows and pre-`version` five-field rows
+(and their old header), so an existing log keeps loading. **Never touch this
+file.**
 
 ## 8. State location
 
@@ -189,25 +199,27 @@ Do not touch it. A human may set the env var for containers.
    every kept diff that touches a file containing `unsafe`.
 2. `results.tsv` and `run.log` are agent-writable (explicitly exempt from the
    scope gate). Forged rows corrupt `report`/`status`, not verdicts.
-3. Baseline-worktree edits without a commit change no `HEAD`, so they are
-   measured but undetected. Only `HEAD` movement trips gate 10.
-4. Gate 1 is git-based: a **gitignored source file** can be edited invisibly
-   (it is neither a locked shape nor hashed).
-5. Freeze/restore covers only the **workspace root** `tests/**`/`benches/**`;
-   member-crate test dirs are run but not frozen.
-6. New in-scope source files never get their inline tests hashed. **Renaming**
+3. New in-scope source files never get their inline tests hashed. **Renaming**
    an existing source file fails with `FAIL(inline_test_modified)`: inline-test
    hashes are keyed by path and a missing path fails closed by design, so the
    rename would look like deleted tests. Split a file by extracting into a new
    module and keeping the old one.
-7. No clippy, no Miri, no allocation metrics (median time only).
-8. `doctor` gates nothing; a throttling laptop still produces verdicts.
-9. The regression guard requires `p < 0.05`; a real 50 % regression measured
-   with high variance can pass unnoticed.
-10. `k` is fixed at baseline (config hash), so a repo with many benchmarks may
-    be unable to KEEP at all — only a warning.
-11. No grace-then-SIGKILL for `stop --force` (10 s, then it reports state).
-12. `program.md` has no integrity check; it is the agent's instruction file,
+4. No clippy, no Miri, no allocation metrics (median time only).
+5. `doctor` gates nothing; a throttling laptop still produces verdicts.
+6. The regression guard needs `p < 0.05` **or** a median slowdown of at least
+   50 % (`verdict::LARGE_REGRESSION_PCT`). A 10–49 % regression measured with
+   high variance can still pass unnoticed.
+7. `k` is fixed at baseline (config hash), so a repo with many benchmarks may
+   be unable to KEEP at all. `baseline` now says so up front; it still does
+   not refuse.
+8. Package discovery for freezing is "a directory with a `Cargo.toml`". A test
+   directory outside any package, or a test path set in `[[test]] path = ...`
+   to somewhere other than `tests/`, is not frozen.
+9. Gitignored sources are covered only when they are `.rs` files outside the
+   scope. An ignored file inside the scope is the agent's to edit; an ignored
+   non-`.rs` file pulled in with `include_str!` is not checked.
+10. No grace-then-SIGKILL for `stop --force` (10 s, then it reports state).
+11. `program.md` has no integrity check; it is the agent's instruction file,
     not a control.
 
 ## 11. program.md rules the driver must obey

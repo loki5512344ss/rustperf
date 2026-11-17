@@ -42,3 +42,21 @@ fn get_handle(child: &Child) -> HANDLE {
     use std::os::windows::io::AsRawHandle;
     child.as_raw_handle() as HANDLE
 }
+
+/// Nothing to record: `kill_tree` assigns the child to a kill-on-close job
+/// object, and a job handle cannot be handed across processes, so there is
+/// no pid a `stop --force` could act on from outside. `cmd_stop` there ends
+/// the target outright instead.
+pub fn record_child(_pid: u32) -> Result<(), String> {
+    Ok(())
+}
+
+/// Nothing was recorded, so there is nothing to remove.
+pub fn clear_child() -> Result<(), String> {
+    Ok(())
+}
+
+/// No record exists on this platform; see [`record_child`].
+pub fn kill_recorded_tree(_eval_pid: u32) -> Result<bool, String> {
+    Ok(false)
+}

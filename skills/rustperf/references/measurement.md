@@ -239,8 +239,9 @@ scripts/instr-count.sh --runs 15 --json instr.json -- './before input.bin' './af
 Simulated alternative: Callgrind (valgrind) counts instructions in a
 simulator, so it works without any PMU access and is close to deterministic;
 `iai-callgrind` wraps it for Rust benchmarks. Cost: tens of times slower than
-native, and the cache model is a simulation, not your CPU. **valgrind is not
-installed on this machine — not verified here.**
+native, and the cache model is a simulation, not your CPU. **Verified 2026-11-13 with
+valgrind 3.25.1: `valgrind --tool=callgrind` + `callgrind_annotate` gave exact
+Ir (651 417) on a test program; `iai-callgrind` was not tried.**
 
 Limits, stated bluntly:
 

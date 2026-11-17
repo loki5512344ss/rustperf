@@ -238,19 +238,69 @@ fn walk_rs(root: &Path, rel: &Path, out: &mut Vec<String>) -> Result<(), String>
     Ok(())
 }
 
-/// Every repo-relative `.rs` file under `tests/` and `benches/`, minus
-/// `exclude`, sorted. These are the tests that live in their own files and so
-/// can be frozen and restored byte for byte.
+/// Every repo-relative `.rs` file under a package's `tests/` and `benches/`,
+/// minus `exclude`, sorted. These are the tests that live in their own files
+/// and so can be frozen and restored byte for byte.
+///
+/// "A package" is any directory that holds a `Cargo.toml`, at any depth, plus
+/// the repository root itself whether or not it has one. Covering only the
+/// root left every workspace member's tests editable: weakening
+/// `crates/core/tests/it.rs` changed no frozen byte, and `cargo test
+/// --workspace` ran the weakened version.
 pub fn frozen_test_files(root: &Path, exclude: &[String]) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
-    for top in ["benches", "tests"] {
-        if root.join(top).is_dir() {
-            walk_rs(root, Path::new(top), &mut out)?;
-        }
-    }
+    collect_package_tests(root, Path::new(""), true, &mut out)?;
     out.retain(|p| !exclude.iter().any(|e| e.replace('\\', "/") == *p));
     out.sort();
+    out.dedup();
     Ok(out)
+}
+
+/// Walks the tree for package roots; at each one, collects its `tests/` and
+/// `benches/`. Does not descend into those two directories (they are walked
+/// whole by `walk_rs`).
+fn collect_package_tests(
+    root: &Path,
+    rel: &Path,
+    is_root: bool,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    let dir = root.join(rel);
+    if is_root || dir.join("Cargo.toml").is_file() {
+        for top in ["benches", "tests"] {
+            if dir.join(top).is_dir() {
+                walk_rs(root, &rel.join(top), out)?;
+            }
+        }
+    }
+    let entries =
+        std::fs::read_dir(&dir).map_err(|e| format!("read dir {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read dir {}: {e}", dir.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_dir = entry
+            .file_type()
+            .map_err(|e| format!("stat {name}: {e}"))?
+            .is_dir();
+        if !is_dir || skip_dir(&name) || name == "tests" || name == "benches" {
+            continue;
+        }
+        collect_package_tests(root, &rel.join(&name), false, out)?;
+    }
+    Ok(())
+}
+
+/// True for a `.rs` file under a `tests/` or `benches/` directory at any
+/// depth: the shape [`frozen_test_files`] freezes, and the shape the scope
+/// and unsafe gates leave to `restore` instead of judging themselves.
+pub fn is_test_or_bench_path(rel: &str) -> bool {
+    let rel = rel.replace('\\', "/");
+    rel.ends_with(".rs")
+        && rel
+            .split('/')
+            .rev()
+            .skip(1)
+            .any(|seg| seg == "tests" || seg == "benches")
 }
 
 /// Every repo-relative `.rs` file the scope allows the agent to edit, sorted.
@@ -262,6 +312,27 @@ pub fn in_scope_sources(root: &Path, m: &Matcher) -> Result<Vec<String>, String>
     all.retain(|p| m.matches(p));
     all.sort();
     Ok(all)
+}
+
+/// Gitignored `.rs` files outside the scope, repo-relative and sorted.
+///
+/// The scope gate works from `git diff` and `git status`, and both omit
+/// ignored paths, so a `.rs` file the repository gitignores can be edited
+/// without any gate noticing. This lists the ones that could matter: not under
+/// `target/` or a dot-directory, not in scope (those are the agent's to edit
+/// and their inline tests are hashed anyway) and not a frozen test file.
+pub fn ignored_sources_outside_scope(root: &Path, m: &Matcher) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = crate::gitx::ignored_files(root)?
+        .into_iter()
+        .filter(|p| p.ends_with(".rs"))
+        .filter(|p| {
+            !p.split('/')
+                .any(|seg| seg == "target" || seg.starts_with('.'))
+        })
+        .filter(|p| !m.matches(p) && !is_test_or_bench_path(p))
+        .collect();
+    out.sort();
+    Ok(out)
 }
 
 /// Directories `locked_files` never walks into: build output and the VCS
@@ -538,6 +609,47 @@ criterion_main!(all);
             frozen_test_files(&repo().root, &[]).unwrap(),
             vec!["benches/b.rs", "tests/it.rs"]
         );
+    }
+
+    #[test]
+    fn frozen_test_files_reach_workspace_members_at_any_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (p, body) in [
+            ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+            ("tests/top.rs", "#[test] fn t() {}\n"),
+            ("crates/a/Cargo.toml", "[package]\nname = \"a\"\n"),
+            ("crates/a/src/lib.rs", "pub fn f() {}\n"),
+            ("crates/a/tests/it.rs", "#[test] fn t() {}\n"),
+            ("crates/a/tests/common/mod.rs", "pub fn h() {}\n"),
+            ("crates/a/benches/b.rs", "fn main() {}\n"),
+            // Not a package (no Cargo.toml): its tests/ is just a directory.
+            ("tools/tests/loose.rs", "fn main() {}\n"),
+            ("crates/a/target/debug/tests/x.rs", "fn main() {}\n"),
+        ] {
+            let path = root.join(p);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        }
+        assert_eq!(
+            frozen_test_files(root, &[]).unwrap(),
+            vec![
+                "crates/a/benches/b.rs",
+                "crates/a/tests/common/mod.rs",
+                "crates/a/tests/it.rs",
+                "tests/top.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_or_bench_path_is_any_rs_file_under_such_a_directory() {
+        assert!(is_test_or_bench_path("tests/it.rs"));
+        assert!(is_test_or_bench_path("crates/a/benches/b.rs"));
+        assert!(is_test_or_bench_path("crates/a/tests/common/mod.rs"));
+        assert!(!is_test_or_bench_path("crates/a/src/lib.rs"));
+        assert!(!is_test_or_bench_path("src/tests.rs"));
+        assert!(!is_test_or_bench_path("tests/data.json"));
     }
 
     #[test]

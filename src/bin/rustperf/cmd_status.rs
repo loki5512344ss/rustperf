@@ -8,17 +8,17 @@
 //!
 //! **It opens nothing for writing.** Checking on a run must never be able to
 //! change it — see `tests/cmd_status_stop.rs`, which snapshots the tree
-//! either side of the call to prove it. It also prints plain text only:
-//! `program.md` promises there is no `--json` form and no `stop_requested`
-//! field of its own, because the machine-readable stop signal already rides
-//! on `eval --json`.
+//! either side of the call to prove it. Plain text by default; `--json`
+//! prints the same facts as one object for a caller that would otherwise parse
+//! the text. The agent's own stop signal is still `stop_requested` on
+//! `eval --json`: `status --json` is for a human's tooling, not the loop.
 
 use crate::args::Args;
 use rustperf_core::{gitx, results, state};
 use std::path::Path;
 
 pub fn run(argv: &[String]) -> i32 {
-    let args = match Args::parse(argv, &[("C", true), ("tag", true)]) {
+    let args = match Args::parse(argv, &[("C", true), ("tag", true), ("json", false)]) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
@@ -62,6 +62,10 @@ fn status(args: &Args) -> Result<String, String> {
     let baseline = state::Baseline::load(&dir.join(state::BASELINE_FILE))?;
     let run_branch = state::branch_name(&tag);
     let current_branch = gitx::current_branch(&root)?;
+
+    if args.flag("json") {
+        return status_json(&root, &dir, &tag, &baseline, &current_branch);
+    }
 
     let mut out = String::new();
     out.push_str(&format!("{:<14} {tag}\n", "run tag"));
@@ -117,6 +121,56 @@ fn status(args: &Args) -> Result<String, String> {
     Ok(out)
 }
 
+/// Counts of each status in `rows`: keep, discard, fail, crash.
+fn status_counts(rows: &[results::Row]) -> [usize; 4] {
+    let n = |s: &str| rows.iter().filter(|r| r.status == s).count();
+    [n("KEEP"), n("DISCARD"), n("FAIL"), n("CRASH")]
+}
+
+/// `status --json`: the facts of the text form as one object. A `results.tsv`
+/// that cannot be read is `experiments: null` plus `experiments_error`, never
+/// a zero count, for the same reason the text form says "unavailable".
+fn status_json(
+    root: &Path,
+    dir: &Path,
+    tag: &str,
+    baseline: &state::Baseline,
+    current_branch: &str,
+) -> Result<String, String> {
+    let run_branch = state::branch_name(tag);
+    let worktree = dir.join(state::WORKTREE_NAME);
+    let mut v = serde_json::json!({
+        "tag": tag,
+        "branch": run_branch,
+        "branch_checked_out": current_branch == run_branch,
+        "current_branch": current_branch,
+        "baseline_commit": baseline.commit,
+        "measure_commit": baseline.measure_commit,
+        "worktree": worktree.display().to_string(),
+        "worktree_exists": worktree.is_dir(),
+        "stop_requested": state::stop_requested(dir),
+    });
+    match results::load(&root.join(results::RESULTS_PATH)) {
+        Ok(rows) => {
+            let [keep, discard, fail, crash] = status_counts(&rows);
+            v["experiments"] = serde_json::json!({
+                "total": rows.len(),
+                "keep": keep,
+                "discard": discard,
+                "fail": fail,
+                "crash": crash,
+            });
+        }
+        Err(e) => {
+            v["experiments"] = serde_json::Value::Null;
+            v["experiments_error"] = serde_json::json!(e);
+        }
+    }
+    let mut text = serde_json::to_string_pretty(&v).map_err(|e| format!("encode status: {e}"))?;
+    text.push('\n');
+    Ok(text)
+}
+
 /// "How far into the loop is it", from `results.tsv` — the same file
 /// `report` reads. A missing or unreadable file is reported as such rather
 /// than as zero experiments: silently claiming a run has done nothing would
@@ -129,19 +183,7 @@ fn experiments_line(root: &Path) -> String {
     if rows.is_empty() {
         return format!("{:<14} none yet\n", "experiments");
     }
-    let mut keep = 0;
-    let mut discard = 0;
-    let mut fail = 0;
-    let mut crash = 0;
-    for r in &rows {
-        match r.status.as_str() {
-            "KEEP" => keep += 1,
-            "DISCARD" => discard += 1,
-            "FAIL" => fail += 1,
-            "CRASH" => crash += 1,
-            _ => {}
-        }
-    }
+    let [keep, discard, fail, crash] = status_counts(&rows);
     format!(
         "{:<14} {} run  ({keep} keep, {discard} discard, {fail} fail, {crash} crash)  — next is \
          #{}\n",

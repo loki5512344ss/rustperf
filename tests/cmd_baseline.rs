@@ -5,10 +5,11 @@ mod common;
 use common::TestRepo;
 
 // `common::run_cli` shares a `CARGO_TARGET_DIR` across fixtures for every
-// command except `eval` — see its doc comment. `baseline` never builds
-// anything (it only freezes files and adds a git worktree), so this file
-// just delegates to it rather than keeping its own copy of the same
-// `Command` construction.
+// command except `eval` — see its doc comment. `baseline` freezes files, adds
+// a git worktree, and then warms that worktree with the release build `eval`
+// would otherwise pay for on its first measurement; it builds only that one
+// worktree, so it still delegates to `run_cli` rather than keeping its own
+// copy of the same `Command` construction.
 fn run(repo: &TestRepo, args: &[&str]) -> std::process::Output {
     common::run_cli(repo, args)
 }
@@ -61,6 +62,14 @@ fn baseline_creates_the_branch_freezes_tests_and_pins_a_worktree() {
         "benches/ must be frozen"
     );
     assert!(state.join("baseline-worktree/Cargo.toml").exists());
+
+    // The pinned worktree must be warm, or the first `eval` of the run pays
+    // for a cold release build.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("(warm: release build ok)"),
+        "baseline must warm the pinned worktree:\n{stdout}"
+    );
 
     // The inline half of the freeze gate must be recorded too.
     let manifest: serde_json::Value =

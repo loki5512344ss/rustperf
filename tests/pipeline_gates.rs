@@ -240,6 +240,7 @@ fn a_repo_reached_through_a_symlinked_ancestor_is_not_tampering() {
                 (rel, hash)
             })
             .collect(),
+        ignored_sources: None,
     };
 
     // Now make an unrelated, uncommitted change to the config: this is what
@@ -432,6 +433,45 @@ fn deleting_the_work_the_benchmark_measures_fails_the_tests() {
 }
 
 // Making the BASELINE slow is a cheaper win than making the candidate fast.
+// Gate 9 compares HEAD only. An uncommitted edit to the pinned worktree moves
+// no commit, so a slowed-down baseline used to be measured without a word.
+#[test]
+fn an_uncommitted_edit_in_the_baseline_worktree_is_detected() {
+    let repo = TestRepo::demo();
+    let (cfg, base, dir) = ready(&repo);
+    let lib = dir.join(state::WORKTREE_NAME).join("src/lib.rs");
+    let mut text = std::fs::read_to_string(&lib).unwrap();
+    text.push_str("\n// slow the baseline down\n");
+    std::fs::write(&lib, text).unwrap();
+    let r = eval_now(&repo, cfg, base, &dir);
+    assert_eq!(r.status, verdict::Status::Fail);
+    assert_eq!(r.reason, verdict::Reason::BaselineTampered);
+    assert!(r.message.contains("uncommitted"), "{}", r.message);
+}
+
+// git never reports a path it ignores, so the git-based scope gate cannot see
+// an edit to a gitignored source file. It is compared by hash instead.
+#[test]
+fn editing_a_gitignored_source_outside_the_scope_fails() {
+    let repo = TestRepo::demo();
+    let gitignore = repo.path().join(".gitignore");
+    let mut text = std::fs::read_to_string(&gitignore).unwrap_or_default();
+    text.push_str("\nignored_gen/\n");
+    std::fs::write(&gitignore, text).unwrap();
+    std::fs::create_dir_all(repo.path().join("ignored_gen")).unwrap();
+    let hidden = repo.path().join("ignored_gen/g.rs");
+    std::fs::write(&hidden, "pub fn g() {}\n").unwrap();
+
+    let (mut cfg, base, dir) = ready(&repo);
+    cfg.scope = vec!["src/**".to_string()];
+    std::fs::write(&hidden, "pub fn g() { /* edited */ }\n").unwrap();
+
+    let r = eval_now(&repo, cfg, base, &dir);
+    assert_eq!(r.status, verdict::Status::Fail);
+    assert_eq!(r.reason, verdict::Reason::ScopeViolation);
+    assert!(r.message.contains("ignored_gen/g.rs"), "{}", r.message);
+}
+
 #[test]
 fn a_moved_baseline_worktree_head_is_detected() {
     let repo = TestRepo::demo();

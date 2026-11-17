@@ -71,6 +71,67 @@ pub fn is_clean(dir: &Path) -> Result<bool, String> {
     Ok(git(dir, &["status", "--porcelain"])?.is_empty())
 }
 
+/// Every file under `dir` that git ignores and that exists on disk,
+/// repo-relative. `git status` and `git diff` never report these, which is
+/// exactly why the scope gate cannot see an edit to one.
+pub fn ignored_files(dir: &Path) -> Result<Vec<String>, String> {
+    let raw = git_raw(
+        dir,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ],
+    )?;
+    let text =
+        String::from_utf8(raw).map_err(|e| format!("git ls-files output is not UTF-8: {e}"))?;
+    Ok(text
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Paths in `dir` that differ from its own `HEAD`: tracked edits, staged
+/// edits and untracked, non-ignored files, minus anything under `target/`.
+///
+/// Used on the pinned baseline worktree, where the answer must be empty: gate
+/// 9 compares only `HEAD`, so an uncommitted edit that slows the baseline
+/// moves no commit and was measured without being noticed.
+pub fn dirty_paths(dir: &Path) -> Result<Vec<String>, String> {
+    let raw = git_raw(
+        dir,
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+    )?;
+    let text =
+        String::from_utf8(raw).map_err(|e| format!("git status output is not UTF-8: {e}"))?;
+    let fields: Vec<&str> = text.split('\0').collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < fields.len() {
+        let field = fields[i];
+        if field.len() < 3 {
+            i += 1;
+            continue;
+        }
+        let path = &field[3..];
+        if !path.is_empty() && path != "target" && !path.starts_with("target/") {
+            out.push(path.to_string());
+        }
+        let status = &field[0..2];
+        i += if status.contains('R') || status.contains('C') {
+            2
+        } else {
+            1
+        };
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 /// Every repo-relative path that differs from `commit`, including
 /// uncommitted and untracked work.
 ///

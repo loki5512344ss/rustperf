@@ -178,6 +178,12 @@ pub struct Baseline {
     /// git-diff-based locked-file check.
     #[serde(default)]
     pub locked_files: std::collections::BTreeMap<String, String>,
+    /// Hash of every gitignored `.rs` file outside the scope at baseline time
+    /// (see [`crate::discover::ignored_sources_outside_scope`]). `None` for a
+    /// baseline recorded before this field existed: the gate is skipped there
+    /// rather than guessed at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_sources: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl Baseline {
@@ -660,6 +666,7 @@ mod tests {
             }],
             config_sha256: "0".repeat(64),
             locked_files: std::collections::BTreeMap::new(),
+            ignored_sources: None,
         }
     }
 

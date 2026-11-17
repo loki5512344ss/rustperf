@@ -156,6 +156,9 @@ fn eval(args: &Args) -> Result<i32, String> {
                 best_bench_delta,
                 status: status_str.clone(),
                 description: args.value("desc").unwrap_or("").to_string(),
+                // Which rustperf produced this row, so a log that spans a
+                // rebuild can be read with the difference in mind.
+                version: env!("CARGO_PKG_VERSION").to_string(),
             },
         )?;
     }

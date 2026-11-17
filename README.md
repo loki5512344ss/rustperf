@@ -19,7 +19,7 @@ live inside the files being changed, and where **correctness is not
 optional**.
 
 > **Status: early but working.** This release is proven by its own test
-> suite — 307 tests in this fork (303 by default plus four `--ignored`
+> suite — 361 tests in this fork (357 by default plus four `--ignored`
 > end-to-end benchmark tests), including tests that drive `eval` to a real
 > `KEEP` and a real `DISCARD` against the bundled demo crate — by one real
 > measured run against that crate, recorded in full in
@@ -37,9 +37,9 @@ optional**.
 > case study and in that report is a real measurement, never an
 > illustration.
 >
-> What version you get, and what changed in it, is on the
-> [releases page](https://github.com/loki5512344ss/rustperf/releases) — this
-> README describes the current one.
+> There are no tagged releases: install from a clone (see below). What
+> changed, and when, is in `git log` and [`docs/fork-notes.md`](docs/fork-notes.md);
+> this README describes the current `main`.
 
 ---
 
@@ -234,13 +234,15 @@ and the pipeline both check every 20 ms, between measurement rounds and
 between gates, so the process gets a real chance to record
 `ABORTED`/`stop_forced` and tear down its own benchmark subprocess (a
 grandchild, in its own process group) cleanly rather than leaving it
-running. **This has a real gap, stated plainly:** there is no
-grace-then-SIGKILL escalation. If `eval` never reaches a poll tick — a
-genuinely wedged process, not the designed path — `--force` cannot clean it
-up, and you would need to kill it by hand. This is a smaller gap than it
-looks: an external `SIGKILL` aimed at `eval`'s own pid would not reach a
-wedged benchmark grandchild in a separate process group either, so
-escalating the signal buys less than it appears to.
+running. If the claim is still held after those 10 seconds, `--force`
+escalates: `runner` records the pid of the command `eval` most recently
+spawned in a temp file, so the escalation SIGKILLs that whole process group
+first (the benchmark grandchild included), then `eval` itself, then clears
+the claim a `SIGKILL`ed process can no longer release. That experiment is
+gone rather than scored, which is what an immediate stop asks for. The one
+thing it cannot do is reach a benchmark whose pid `eval` never got to
+record — a wedged `eval` between `spawn` and the record write — so a
+machine-level `SIGKILL` by hand remains the last resort.
 
 On Windows, the claim a live `eval` holds on its `eval.pid` file is a real,
 OS-enforced guarantee too — an exclusive file-sharing handle
@@ -608,7 +610,9 @@ None of these is cosmetic, and none of them is going to change soon.
   `-benchmem`. Criterion measures time only, and counting allocations would
   mean installing a `#[global_allocator]` in the user's benchmark
   harness — editing the very code under measurement. So `results.tsv` drops
-  the `allocs_delta` column and carries five fields, not six.
+  the `allocs_delta` column and carries six fields, where the sixth is the
+  `rustperf` version that wrote the row (so a log spanning a tool upgrade is
+  still readable).
 
   This costs more than a column. An allocation count is often an agent's
   single best lead for *what to try next* — "this loop allocates 400 times
@@ -634,11 +638,6 @@ None of these is cosmetic, and none of them is going to change soon.
   [What the harness enforces](#what-the-harness-enforces)). An agent that
   edits a `#[cfg(test)]` assertion or a doctest gets a `FAIL` and a wasted
   experiment slot rather than a silent erasure.
-- **Freeze/restore only covers the workspace root's `tests/**` and
-  `benches/**`.** A workspace member's own `crates/foo/tests/**` is not
-  snapshotted or restored, even though `build`/`test`/`measure` all run
-  `--workspace` and so do exercise it. If your `scope` reaches into a
-  member crate, its integration tests are not frozen the way the root's are.
 - **`unsafe` is gated, but narrowly.** This fork fails any experiment whose
   diff adds or changes an `unsafe` region relative to baseline with
   `FAIL(unsafe_added)`. Removing or relocating existing, unchanged `unsafe`
@@ -648,10 +647,12 @@ None of these is cosmetic, and none of them is going to change soon.
   proc macro. Upstream has no such gate. Set `allow_unsafe: true` in
   `.rustperf/config.yaml` to disable the gate (human-only; default
   `false`).
-- **The baseline worktree compiles from cold on a run's first `eval`.** The
-  pinned worktree has no warm `target/` the first time it is measured
-  against, so the first experiment of a run pays a full release build on
-  the baseline side that later experiments do not.
+- **The warm-up build at `baseline` is best-effort.** `baseline` now builds
+  the pinned worktree in release so the first `eval` does not pay for a cold
+  build, but a failed or timed-out warm-up only warns: `baseline` still pins
+  the run, and `eval` is where a build that does not compile is reported.
+  The warm-up also writes into the worktree's own `target/`, which
+  `gitx::dirty_paths` ignores, so the clean-worktree gate is unaffected.
 
 ### Fork changes
 
@@ -666,6 +667,30 @@ This branch is a fork. In addition to the upstream harness, it adds:
   `DISCARD`), the JSON object includes a `benchmarks` array (name,
   `base_ns`, `cand_ns`, `pct_change`, `p`, `significant`,
   `keep_threshold_p`, `n_base`, `n_cand`).
+- **Wider freezing and tamper checks (2026-11-15).** Every package's
+  `tests/` and `benches/` are frozen, not only the workspace root's, so a
+  member crate's tests can no longer be weakened. The pinned baseline worktree
+  must be clean as well as at the right commit (`FAIL(baseline_tampered)`).
+  Gitignored `.rs` files outside the scope are hashed at baseline and compared
+  on every `eval`. The regression guard also trips on a median slowdown of
+  50 % or more whatever its p-value. `baseline` warns when `count` and the
+  number of benchmarks make a `KEEP` unreachable.
+- **`status --json` and `report --json`.** The same facts as the text, as one
+  object.
+- **Warm baseline worktree, a `version` column, two new doctor checks
+  (2026-11-17).** `baseline` builds the pinned worktree in release so the
+  first `eval` is not paying for a cold build (a failed warm-up warns and
+  continues). Every `results.tsv` row records the `rustperf` version that
+  wrote it; five-field logs still load. `doctor` warns when Cargo's
+  `global-min-publish-age` cooldown is unset and when the compiler is less
+  than seven days old, and mentions `--jobs-frontend` on nightly.
+- **`stop --force` escalates.** If `eval` has not released its claim 10
+  seconds after `SIGTERM`, the recorded benchmark process group is
+  `SIGKILL`ed, then `eval`, then its claim is cleared — instead of leaving a
+  wedged benchmark burning CPU.
+- **A weekly CI job for the slow tests.** `schedule` plus
+  `workflow_dispatch` run the four `#[ignore]`d end-to-end tests, which the
+  push and pull-request jobs never execute.
 - **New scripts** in `scripts/`: `instr-count.sh`, `layout-check.sh`,
   `vec-remarks.sh`, `perf-diff.sh`, `diff-fuzz.sh` (pre-existing:
   `bench-ab.sh`, `perf-report.sh`, `asm-report.sh`).
@@ -682,7 +707,7 @@ skill details.
 Three things back this tool, and it is worth being precise about what each
 one does and does not establish.
 
-**Its own test suite** — 307 tests in this fork (303 by default plus four
+**Its own test suite** — 361 tests in this fork (357 by default plus four
 `--ignored` end-to-end benchmark tests, counted with
 `cargo test --all-targets -- --list`), including tests that drive `eval` to a
 real `KEEP` and a real `DISCARD` against the bundled `testdata/demo` crate.
@@ -724,29 +749,30 @@ benchmarks running for hours unattended. That run has not happened.
 
 Two narrower gaps, named rather than glossed over:
 
-- **`stop --force` has no grace-then-SIGKILL escalation** — see
-  [Watching a run, and stopping it](#watching-a-run-and-stopping-it) above
-  for the full explanation and why the residual gap is smaller than it
-  looks.
-- **CI now runs this crate's test suite on Windows, but four
-  `#[ignore]`d end-to-end tests still never execute on any platform, and
-  nobody has used this on physical or interactively-used Windows
-  hardware.** Until recently the Windows CI job only compiled and linted;
-  it now runs `cargo test` there too, which is what caught (and this
-  release fixed) three Windows-only failures, including one in
-  `EvalClaim`'s own liveness check — Windows now gets the same
-  lock-based guarantee unix does (an exclusive file-sharing handle in
-  place of `flock`), verified by the same platform-agnostic unit tests on
-  both. What CI still does not run anywhere, Windows included, is the four
-  tests marked `#[ignore]` because they drive a real, slow benchmark to a
-  real `KEEP`/`DISCARD`/abort — among them
+- **The `stop --force` escalation is verified by hand, not by CI.** A
+  wedged `eval` that holds its claim and never reaches a poll tick cannot be
+  reproduced deterministically, so the grace-then-`SIGKILL` path is
+  exercised with a fake `eval` manually; CI covers its pieces (the child
+  record, the pid parsing, the "nothing to kill" cases) and the polite
+  `SIGTERM` path end to end. See
+  [Watching a run, and stopping it](#watching-a-run-and-stopping-it).
+- **CI now runs this crate's test suite on Windows, but nobody has used
+  this on physical or interactively-used Windows hardware.** Until
+  recently the Windows CI job only compiled and linted; it now runs
+  `cargo test` there too, which is what caught (and this release fixed)
+  three Windows-only failures, including one in `EvalClaim`'s own liveness
+  check — Windows now gets the same lock-based guarantee unix does (an
+  exclusive file-sharing handle in place of `flock`), verified by the same
+  platform-agnostic unit tests on both. The four tests marked `#[ignore]`
+  because they drive a real, slow benchmark to a real
+  `KEEP`/`DISCARD`/abort — among them
   `stop_force_aborts_an_in_flight_eval_and_writes_no_results_row`, the one
-  test that exercises a real `stop --force` against a real running `eval`.
-  CI never passes `--ignored`, on any platform, so that path — and
-  `OpenProcess`/`TerminateProcess` termination specifically on Windows —
-  is exercised by unit tests only, never by an actual `eval` process
-  there. Adding an `--ignored` CI job is not the fix: each ignored test
-  does a full release build and would make CI unusably slow.
+  test that exercises a real `stop --force` against a real running `eval` —
+  used to never execute anywhere. A separate scheduled job (weekly, plus
+  manual dispatch) now runs them on ubuntu with `--ignored`; they stay out
+  of the push and pull-request jobs because each one does a full release
+  build. That path is therefore exercised weekly on Linux, and still only
+  by unit tests on Windows.
 
 ## Repos with no benchmarks
 
