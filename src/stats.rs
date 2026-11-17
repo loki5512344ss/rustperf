@@ -299,6 +299,149 @@ fn erfc(x: f64) -> f64 {
     if x >= 0.0 { ans } else { 2.0 - ans }
 }
 
+/// How many resamples [`bootstrap_pct_change`] draws. 2000 is the usual floor
+/// for a stable 2.5 %/97.5 % percentile; more would not change what a
+/// benchmark report can honestly say.
+pub const BOOTSTRAP_RESAMPLES: usize = 2000;
+
+/// A fixed seed, not a random one: two runs over the same data must print the
+/// same interval, or a report cannot be diffed against the last one.
+const BOOTSTRAP_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// xorshift64* — small, dependency-free, and good enough to pick resample
+/// indices. Not for anything that needs more than that.
+struct Xorshift64(u64);
+
+impl Xorshift64 {
+    const fn new(seed: u64) -> Self {
+        // The all-zero state is a fixed point of the generator.
+        Xorshift64(if seed == 0 {
+            0x2545_f491_4f6c_dd1d
+        } else {
+            seed
+        })
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// An index below `n`. The modulo bias for the sample sizes here is far
+    /// below one part in 2^32 and cannot move a percentile.
+    fn below(&mut self, n: usize) -> usize {
+        (self.next_u64() % n as u64) as usize
+    }
+}
+
+/// A percentile bootstrap interval for the percent change in the median.
+///
+/// Each resample draws `base.len()` observations with replacement from `base`
+/// and `cand.len()` from `cand`, takes both medians, and records
+/// `(median(cand_sample) / median(base_sample) - 1) * 100`. The result is the
+/// low and high quantile of those [`BOOTSTRAP_RESAMPLES`] values, derived from
+/// [`CONFIDENCE`] — 2.5 % and 97.5 % at the default 95 % level.
+///
+/// A resample whose base median is zero cannot form a ratio, and one that
+/// draws a non-finite round yields a non-finite ratio: both are skipped rather
+/// than allowed into the sorted vector as `±inf`/`NaN`. If no valid resample
+/// remains, there is no interval and both bounds are `NAN`.
+///
+/// It is a percentile interval over the median ratio, so it inherits the
+/// bootstrap's assumptions: the rounds are independent draws from the same
+/// distribution, which is already the premise of the U test beside it. With the
+/// handful of rounds a benchmark sweep can afford the interval is WIDE by
+/// construction — that is the point. An interval of ±8 % around a ±1 % change
+/// says "this measurement cannot see your change", something a p-value alone
+/// cannot say.
+///
+/// The generator is seeded from a constant, so the same input always yields the
+/// same interval. Either side empty yields `(NAN, NAN)`; one observation on
+/// each side yields that point estimate twice when it is finite, and
+/// `(NAN, NAN)` otherwise.
+pub fn bootstrap_pct_change(base: &[f64], cand: &[f64]) -> (f64, f64) {
+    if base.is_empty() || cand.is_empty() {
+        return (f64::NAN, f64::NAN);
+    }
+    if base.len() == 1 && cand.len() == 1 {
+        let point = median_ratio_pct(base[0], cand[0]);
+        return if point.is_finite() {
+            (point, point)
+        } else {
+            (f64::NAN, f64::NAN)
+        };
+    }
+
+    let mut rng = Xorshift64::new(BOOTSTRAP_SEED);
+    let mut base_sample = vec![0.0; base.len()];
+    let mut cand_sample = vec![0.0; cand.len()];
+    let mut changes = Vec::with_capacity(BOOTSTRAP_RESAMPLES);
+    for _ in 0..BOOTSTRAP_RESAMPLES {
+        fill_resample(base, &mut base_sample, &mut rng);
+        fill_resample(cand, &mut cand_sample, &mut rng);
+        let base_center = median_in_place(&mut base_sample);
+        let cand_center = median_in_place(&mut cand_sample);
+        // A zero base median has no ratio, and a non-finite one must not sort
+        // into the vector and poison a quantile that is otherwise well defined.
+        if base_center == 0.0 {
+            continue;
+        }
+        let change = median_ratio_pct(base_center, cand_center);
+        if !change.is_finite() {
+            continue;
+        }
+        changes.push(change);
+    }
+    if changes.is_empty() {
+        return (f64::NAN, f64::NAN);
+    }
+    // `total_cmp` is a total order even if a NaN slipped through, and it sorts
+    // without the arbitrary tie position of `partial_cmp(..).unwrap_or(Equal)`.
+    changes.sort_by(f64::total_cmp);
+    let tail = (1.0 - CONFIDENCE) / 2.0;
+    (
+        quantile_sorted(&changes, tail),
+        quantile_sorted(&changes, 1.0 - tail),
+    )
+}
+
+/// `(cand_center / base_center - 1) * 100`, the same units as
+/// [`crate::bench::Delta::pct_change`].
+fn median_ratio_pct(base_center: f64, cand_center: f64) -> f64 {
+    (cand_center / base_center - 1.0) * 100.0
+}
+
+fn fill_resample(source: &[f64], out: &mut [f64], rng: &mut Xorshift64) {
+    for slot in out.iter_mut() {
+        *slot = source[rng.below(source.len())];
+    }
+}
+
+/// The median of `values`, reordering them in place so a resample does not
+/// have to allocate a second buffer.
+fn median_in_place(values: &mut [f64]) -> f64 {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    median_of_sorted(values)
+}
+
+/// The `q` quantile of an ascending slice, linearly interpolated between the
+/// two neighbouring order statistics.
+fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
+    let n = sorted.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    let pos = q.clamp(0.0, 1.0) * (n - 1) as f64;
+    let lo = pos.floor() as usize;
+    let hi = (lo + 1).min(n - 1);
+    let frac = pos - lo as f64;
+    sorted[lo] + (sorted[hi] - sorted[lo]) * frac
+}
+
 /// The smallest two-sided p-value the U test can return for samples of size
 /// `n1` and `n2`: `2 / C(n1+n2, n1)`.
 ///
@@ -457,6 +600,105 @@ mod tests {
         let s = summary(&[42.0], CONFIDENCE);
         assert_eq!(s.center, 42.0);
         assert!(!s.warnings.is_empty());
+    }
+
+    // The bootstrap is seeded from a constant, so the same input must always
+    // produce bit-identical bounds: an interval that changed between two reads
+    // of the same data would make reports impossible to diff.
+    #[test]
+    fn bootstrap_is_deterministic() {
+        let base = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0];
+        let cand = [90.0, 91.0, 93.0, 95.0, 96.0, 98.0, 100.0];
+        let first = bootstrap_pct_change(&base, &cand);
+        let second = bootstrap_pct_change(&base, &cand);
+        assert_eq!(first, second);
+    }
+
+    // A constant sample has exactly one possible resampled median, so this is
+    // the one case where an exact value follows from the data rather than from
+    // the seed: the interval is the point estimate with no width at all.
+    #[test]
+    fn bootstrap_of_constant_samples_is_exactly_the_point() {
+        assert_eq!(bootstrap_pct_change(&[100.0; 6], &[100.0; 6]), (0.0, 0.0));
+        let point = (80.0 / 100.0 - 1.0) * 100.0;
+        assert_eq!(
+            bootstrap_pct_change(&[100.0; 6], &[80.0; 6]),
+            (point, point)
+        );
+    }
+
+    #[test]
+    fn bootstrap_of_one_observation_per_side_collapses_to_the_point() {
+        assert_eq!(bootstrap_pct_change(&[200.0], &[150.0]), (-25.0, -25.0));
+        assert_eq!(bootstrap_pct_change(&[3.0], &[3.0]), (0.0, 0.0));
+    }
+
+    #[test]
+    fn bootstrap_brackets_the_point_estimate_on_clean_data() {
+        let base = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0];
+        let cand = [50.0, 51.0, 52.0, 53.0, 54.0, 55.0];
+        let point =
+            (summary(&cand, CONFIDENCE).center / summary(&base, CONFIDENCE).center - 1.0) * 100.0;
+        let (lo, hi) = bootstrap_pct_change(&base, &cand);
+        assert!(lo.is_finite() && hi.is_finite(), "lo={lo} hi={hi}");
+        assert!(lo <= point && point <= hi, "lo={lo} point={point} hi={hi}");
+    }
+
+    // Same medians, so the same point estimate, but one sample is far more
+    // dispersed. The interval must say so instead of looking identical.
+    #[test]
+    fn bootstrap_widens_when_the_same_median_comes_from_noisier_samples() {
+        let cand = [50.0, 51.0, 52.0, 53.0, 54.0, 55.0];
+        let clean = [101.0, 102.0, 102.0, 103.0, 103.0, 104.0];
+        let noisy = [1.0, 10.0, 102.0, 103.0, 400.0, 500.0];
+        assert_eq!(
+            summary(&clean, CONFIDENCE).center,
+            summary(&noisy, CONFIDENCE).center,
+            "the two baselines must share a median for this comparison to mean anything"
+        );
+        let (clean_lo, clean_hi) = bootstrap_pct_change(&clean, &cand);
+        let (noisy_lo, noisy_hi) = bootstrap_pct_change(&noisy, &cand);
+        assert!(
+            noisy_hi - noisy_lo > clean_hi - clean_lo,
+            "noisy [{noisy_lo}, {noisy_hi}] should be wider than clean [{clean_lo}, {clean_hi}]"
+        );
+    }
+
+    #[test]
+    fn bootstrap_of_identical_samples_contains_zero() {
+        let sample = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0];
+        let (lo, hi) = bootstrap_pct_change(&sample, &sample);
+        assert!(lo <= 0.0 && 0.0 <= hi, "lo={lo} hi={hi}");
+    }
+
+    #[test]
+    fn bootstrap_of_an_empty_side_is_nan() {
+        let (lo, hi) = bootstrap_pct_change(&[], &[1.0, 2.0, 3.0]);
+        assert!(lo.is_nan() && hi.is_nan());
+        let (lo, hi) = bootstrap_pct_change(&[1.0, 2.0, 3.0], &[]);
+        assert!(lo.is_nan() && hi.is_nan());
+    }
+
+    // A single non-finite round must not poison the whole interval: a resample
+    // that happens to draw it is invalid and is skipped, not sorted in as NaN
+    // or ±inf. The remaining valid resamples still describe the data.
+    #[test]
+    fn bootstrap_skips_non_finite_resamples() {
+        let base = [100.0, 101.0, 102.0, 103.0, 104.0, f64::NAN];
+        let cand = [90.0, 91.0, 92.0, 93.0, 94.0, f64::INFINITY];
+        let (lo, hi) = bootstrap_pct_change(&base, &cand);
+        assert!(lo.is_finite() && hi.is_finite(), "lo={lo} hi={hi}");
+        assert!(lo <= hi, "lo={lo} hi={hi}");
+    }
+
+    // A zero base median cannot form a ratio, so those resamples are skipped
+    // too; when every draw is like that there is no interval to report.
+    #[test]
+    fn bootstrap_with_no_valid_resample_is_nan() {
+        let (lo, hi) = bootstrap_pct_change(&[0.0, 0.0], &[1.0, 2.0]);
+        assert!(lo.is_nan() && hi.is_nan(), "lo={lo} hi={hi}");
+        let (lo, hi) = bootstrap_pct_change(&[0.0], &[1.0]);
+        assert!(lo.is_nan() && hi.is_nan(), "lo={lo} hi={hi}");
     }
 
     // Above the exact test's range the normal approximation takes over; the

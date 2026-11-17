@@ -14,7 +14,7 @@
 //! `eval --json`: `status --json` is for a human's tooling, not the loop.
 
 use crate::args::Args;
-use rustperf_core::{gitx, results, state};
+use rustperf_core::{gitx, noise, results, state};
 use std::path::Path;
 
 pub fn run(argv: &[String]) -> i32 {
@@ -117,6 +117,7 @@ fn status(args: &Args) -> Result<String, String> {
         ));
     }
     out.push_str(&experiments_line(&root));
+    out.push_str(&noise_lines(&root, &dir));
     out.push_str(&stop_lines(&dir));
     Ok(out)
 }
@@ -166,6 +167,14 @@ fn status_json(
             v["experiments_error"] = serde_json::json!(e);
         }
     }
+    // Omitted entirely while there is no data: a run with no `noise.jsonl`
+    // (or one too short to aggregate) has nothing to report, and an empty
+    // array would read as "measured, found no noise".
+    if let Ok(floors) = noise::floors(dir) {
+        if !floors.is_empty() {
+            v["noise"] = noise::rows_json(&floors, noise::min_effect_pct(root));
+        }
+    }
     let mut text = serde_json::to_string_pretty(&v).map_err(|e| format!("encode status: {e}"))?;
     text.push('\n');
     Ok(text)
@@ -191,6 +200,20 @@ fn experiments_line(root: &Path) -> String {
         rows.len(),
         rows.len() + 1
     )
+}
+
+/// The per-benchmark noise floors, once at least four experiments have
+/// measured them. Read-only like every other line here: `noise::floors` only
+/// reads the JSONL file, and a file that is not there is simply no floors.
+///
+/// An unreadable file is reported as such rather than swallowed, matching
+/// `experiments_line`: claiming nothing is known about the noise would be
+/// worse than admitting the file could not be read.
+fn noise_lines(root: &Path, dir: &Path) -> String {
+    match noise::floors(dir) {
+        Ok(floors) => noise::status_block(&floors, noise::min_effect_pct(root)),
+        Err(e) => format!("{:<14} unavailable ({e})\n", "noise floor"),
+    }
 }
 
 fn stop_lines(dir: &Path) -> String {

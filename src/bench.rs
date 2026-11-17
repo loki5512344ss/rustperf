@@ -146,6 +146,17 @@ pub struct Delta {
     pub ratio: f64,
     /// `(ratio - 1) * 100`.
     pub pct_change: f64,
+    /// The 2.5 %/97.5 % percentile bootstrap interval for `pct_change`, in the
+    /// same percent units. `NAN` when it could not be computed (an empty
+    /// sample).
+    ///
+    /// Omitted from the serialized form rather than sent as `null` when not
+    /// finite: `serde_json` turns a non-finite number into `null`, which a
+    /// parser cannot tell apart from a key that was never there.
+    #[serde(skip_serializing_if = "interval_missing")]
+    pub ci_low: f64,
+    #[serde(skip_serializing_if = "interval_missing")]
+    pub ci_high: f64,
     /// The Mann-Whitney p-value and the raw, uncorrected rejection threshold.
     pub p: f64,
     pub alpha: f64,
@@ -157,6 +168,23 @@ pub struct Delta {
     pub n_cand: usize,
     /// Warnings from the two summaries and the comparison, deduplicated.
     pub warnings: Vec<String>,
+}
+
+/// serde predicate: leave a bootstrap bound out when it is not a real number.
+fn interval_missing(v: &f64) -> bool {
+    !v.is_finite()
+}
+
+/// A half interval is not a result: if either bound is not a real number,
+/// neither is reported. Serialising only the finite side would emit a lone
+/// `ci_low` (or `ci_high`), which a reader cannot distinguish from the other
+/// key having been omitted for some other reason.
+fn finite_interval(low: f64, high: f64) -> (f64, f64) {
+    if low.is_finite() && high.is_finite() {
+        (low, high)
+    } else {
+        (f64::NAN, f64::NAN)
+    }
 }
 
 /// Compares one benchmark across two measurement sets.
@@ -185,6 +213,10 @@ fn compare_one(base: &Set, cand: &Set, name: &str) -> Result<Delta, String> {
         ));
     }
     let ratio = c_sum.center / b_sum.center;
+    // Dropping both bounds when either is non-finite keeps a serialized row
+    // from carrying a lone half interval.
+    let (raw_low, raw_high) = stats::bootstrap_pct_change(&bv, &cv);
+    let (ci_low, ci_high) = finite_interval(raw_low, raw_high);
 
     let mut warnings = Vec::new();
     for w in b_sum
@@ -204,6 +236,8 @@ fn compare_one(base: &Set, cand: &Set, name: &str) -> Result<Delta, String> {
         cand_center: c_sum.center,
         ratio,
         pct_change: (ratio - 1.0) * 100.0,
+        ci_low,
+        ci_high,
         p: cmp.p,
         alpha: cmp.alpha,
         significant: cmp.p < cmp.alpha,
@@ -326,6 +360,54 @@ mod tests {
         assert_eq!(d.n_cand, 6);
     }
 
+    #[test]
+    fn delta_carries_a_bootstrap_interval_around_the_point_estimate() {
+        let base = set_of("b", &[100.0, 101.0, 102.0, 103.0, 104.0, 105.0]);
+        let cand = set_of("b", &[50.0, 51.0, 52.0, 53.0, 54.0, 55.0]);
+        let deltas = compare_all(&base, &cand).unwrap();
+        let d = &deltas[0];
+        assert!(d.ci_low.is_finite() && d.ci_high.is_finite(), "{d:?}");
+        assert!(
+            d.ci_low <= d.pct_change && d.pct_change <= d.ci_high,
+            "interval [{}, {}] must bracket {}",
+            d.ci_low,
+            d.ci_high,
+            d.pct_change
+        );
+    }
+
+    #[test]
+    fn a_non_finite_interval_is_omitted_from_json_rather_than_sent_as_null() {
+        let mut d = delta_with_ratio("a", 0.5);
+        d.ci_low = f64::NAN;
+        d.ci_high = f64::NAN;
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(!json.contains("ci_low"), "{json}");
+        assert!(!json.contains("ci_high"), "{json}");
+        let json = serde_json::to_string(&delta_with_ratio("a", 0.5)).unwrap();
+        assert!(json.contains("\"ci_low\""), "{json}");
+    }
+
+    // A half interval is worse than no interval: one bound alone reads as if
+    // the other side were never computed, and a consumer cannot tell that from
+    // a complete result with one key omitted. This is the normalisation
+    // `compare_one` applies, so BOTH bounds must disappear when either is
+    // non-finite.
+    #[test]
+    fn a_half_finite_interval_is_never_serialized_as_a_lone_key() {
+        let mut d = delta_with_ratio("a", 0.5);
+        let (low, high) = finite_interval(d.ci_low, f64::NAN);
+        d.ci_low = low;
+        d.ci_high = high;
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(!json.contains("ci_low"), "{json}");
+        assert!(!json.contains("ci_high"), "{json}");
+
+        // The finite pair is left exactly as it was.
+        let (low, high) = finite_interval(-3.0, -1.0);
+        assert_eq!((low, high), (-3.0, -1.0));
+    }
+
     // A benchmark that vanishes from the candidate cannot be checked for
     // regressions, which would hide a real problem behind a clean-looking score.
     #[test]
@@ -361,17 +443,20 @@ mod tests {
     }
 
     fn delta_with_ratio(name: &str, ratio: f64) -> Delta {
+        let pct = (ratio - 1.0) * 100.0;
         Delta {
             name: name.to_string(),
             base_center: 1.0,
             cand_center: ratio,
             ratio,
-            pct_change: (ratio - 1.0) * 100.0,
+            pct_change: pct,
             p: 0.01,
             alpha: 0.05,
             significant: true,
             n_base: 10,
             n_cand: 10,
+            ci_low: pct - 1.0,
+            ci_high: pct + 1.0,
             warnings: Vec::new(),
         }
     }

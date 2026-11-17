@@ -19,7 +19,7 @@ live inside the files being changed, and where **correctness is not
 optional**.
 
 > **Status: early but working.** This release is proven by its own test
-> suite — 361 tests in this fork (357 by default plus four `--ignored`
+> suite — 435 tests in this fork (431 by default plus four `--ignored`
 > end-to-end benchmark tests), including tests that drive `eval` to a real
 > `KEEP` and a real `DISCARD` against the bundled demo crate — by one real
 > measured run against that crate, recorded in full in
@@ -647,6 +647,13 @@ None of these is cosmetic, and none of them is going to change soon.
   proc macro. Upstream has no such gate. Set `allow_unsafe: true` in
   `.rustperf/config.yaml` to disable the gate (human-only; default
   `false`).
+- **The noise floor needs history, and it is per run.** It is computed from
+  this run's own `noise.jsonl` in the state directory, so the first three
+  measured experiments show nothing and a new `baseline` starts over. It
+  measures round-to-round dispersion of the pinned baseline binary within a
+  session; it does not capture drift between days, or another machine. A
+  failed write is only a warning in `run.log`, so with `--no-log` the run can
+  quietly fail to accumulate a floor.
 - **The warm-up build at `baseline` is best-effort.** `baseline` now builds
   the pinned worktree in release so the first `eval` does not pay for a cold
   build, but a failed or timed-out warm-up only warns: `baseline` still pins
@@ -684,6 +691,22 @@ This branch is a fork. In addition to the upstream harness, it adds:
   wrote it; five-field logs still load. `doctor` warns when Cargo's
   `global-min-publish-age` cooldown is unset and when the compiler is less
   than seven days old, and mentions `--jobs-frontend` on nightly.
+- **`leads` in `eval --json` (2026-11-17).** A `syn` pass over the changed
+  in-scope sources reports the patterns the idea bank names, but only where
+  this candidate introduced them: `format!`/`to_string()`/`clone()`/
+  `collect()` in a loop, `contains_key` followed by `insert`, and a `collect()`
+  whose result the next statement only iterates. Each lead carries kind, file,
+  line, function and the trade-off to weigh; it never affects a verdict, and
+  a failed scan becomes `leads_error` instead of a failed experiment.
+- **Measurement quality (2026-11-17).** Each benchmark row in `eval --json`
+  gains `ci_low`/`ci_high`: a deterministic percentile bootstrap interval for
+  the median percent change, next to the p-value and omitted when not finite.
+  A `noise floor` line in `status` and `report` aggregates, from four measured
+  experiments on, how far the median the verdict compares can move at this
+  round count (robust MAD sigma scaled by `1.2533/sqrt(n)`), and says when
+  `min_effect_pct` is below it — the run cannot honestly see a change that
+  small. Raising `count` lowers the floor by `1/sqrt(n)`. Both are advisory and
+  change no verdict.
 - **`stop --force` escalates.** If `eval` has not released its claim 10
   seconds after `SIGTERM`, the recorded benchmark process group is
   `SIGKILL`ed, then `eval`, then its claim is cleared — instead of leaving a
@@ -707,7 +730,7 @@ skill details.
 Three things back this tool, and it is worth being precise about what each
 one does and does not establish.
 
-**Its own test suite** — 361 tests in this fork (357 by default plus four
+**Its own test suite** — 435 tests in this fork (431 by default plus four
 `--ignored` end-to-end benchmark tests, counted with
 `cargo test --all-targets -- --list`), including tests that drive `eval` to a
 real `KEEP` and a real `DISCARD` against the bundled `testdata/demo` crate.

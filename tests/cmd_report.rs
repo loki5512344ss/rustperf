@@ -13,6 +13,35 @@ fn row(status: &str, score: f64) -> Row {
     }
 }
 
+/// A repository with an initialized run, so the current branch names a run
+/// tag and `report` can find the run's state directory.
+fn ready(tag: &str) -> TestRepo {
+    let repo = TestRepo::demo();
+    common::run_cli(&repo, &["init"]);
+    common::git(repo.path(), &["add", "-A"]);
+    common::git(repo.path(), &["commit", "-qm", "init"]);
+    let out = common::run_cli(&repo, &["baseline", "--tag", tag]);
+    assert!(
+        out.status.success(),
+        "baseline: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    repo
+}
+
+/// Writes `noise.jsonl` into the run's state directory as the harness would,
+/// one record per value.
+fn write_noise(dir: &std::path::Path, name: &str, pcts: &[f64]) {
+    let mut text = String::new();
+    for &pct in pcts {
+        text.push_str(&format!(
+            "{{\"benchmarks\":[{{\"name\":\"{name}\",\"noise_pct\":{pct},\
+             \"base_ns\":44702.0,\"cand_ns\":38636.0,\"n\":10}}]}}\n"
+        ));
+    }
+    std::fs::write(dir.join("noise.jsonl"), text).expect("write noise history");
+}
+
 #[test]
 fn report_counts_by_status_and_multiplies_kept_scores() {
     let repo = TestRepo::demo();
@@ -108,4 +137,59 @@ fn report_json_is_one_parseable_object_with_the_same_numbers() {
     assert_eq!(v["experiments"], 3);
     assert_eq!(v["keep"], 2);
     assert!((v["cumulative_score"].as_f64().unwrap() - 0.4).abs() < 1e-9);
+}
+
+// H1: the report carries the per-benchmark noise floor once at least four
+// experiments have measured it, and says when `min_effect_pct` sits below it.
+#[test]
+fn report_shows_the_noise_floor_and_flags_min_effect_below_it() {
+    let repo = ready("t1");
+    let dir = common::state_dir(&repo, "t1");
+    write_noise(&dir, "count_words", &[1.0, 2.0, 3.0, 4.0]);
+
+    let text = String::from_utf8_lossy(&common::run_cli(&repo, &["report"]).stdout).into_owned();
+    assert!(text.contains("noise floor"), "{text}");
+    // Median of [1,2,3,4], not the mean: 2.50 %.
+    assert!(text.contains("count_words ±2.50 % over 4 evals"), "{text}");
+    assert!(
+        text.contains("min_effect_pct 1.0 % is below it"),
+        "the default 1 % threshold is under a 2.5 % floor:\n{text}"
+    );
+
+    let out = common::run_cli(&repo, &["report", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");
+    assert_eq!(v["noise"][0]["benchmark"], "count_words");
+    assert_eq!(v["noise"][0]["experiments"], 4);
+    assert_eq!(v["noise"][0]["min_effect_below"], true);
+}
+
+// Fewer than four experiments is not a floor yet: one unlucky eval must not
+// define what the run can see.
+#[test]
+fn report_omits_a_benchmark_measured_too_few_times() {
+    let repo = ready("t1");
+    let dir = common::state_dir(&repo, "t1");
+    write_noise(&dir, "count_words", &[1.0, 2.0, 3.0]);
+
+    let text = String::from_utf8_lossy(&common::run_cli(&repo, &["report"]).stdout).into_owned();
+    assert!(!text.contains("noise floor"), "{text}");
+
+    let out = common::run_cli(&repo, &["report", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");
+    assert!(v.get("noise").is_none(), "{v}");
+}
+
+// The tag can only come from a run branch. On any other branch the noise
+// section is omitted; the report itself must still work.
+#[test]
+fn report_omits_the_noise_section_off_a_run_branch() {
+    let repo = TestRepo::demo();
+    let p = repo.path().join(results::RESULTS_PATH);
+    results::append(&p, &row("KEEP", 0.9)).unwrap();
+
+    let out = common::run_cli(&repo, &["report"]);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("1 keep"), "{text}");
+    assert!(!text.contains("noise floor"), "{text}");
 }

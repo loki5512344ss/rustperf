@@ -14,7 +14,7 @@
 
 use crate::args::Args;
 use rustperf_core::verdict::Status;
-use rustperf_core::{config, gitx, pipeline, results, state};
+use rustperf_core::{config, gitx, leads, pipeline, results, scope, state, stats};
 use serde_json::json;
 use std::io::Write;
 
@@ -126,7 +126,27 @@ fn eval(args: &Args) -> Result<i32, String> {
         cfg,
         baseline,
     };
+    // Captured BEFORE the pipeline runs: a KEEP advances `measure_commit` to
+    // the candidate's own commit, and the leads must be subtracted against
+    // what this experiment was actually measured against. Reading it after
+    // `eval` would either hide every smell of a kept candidate (the new
+    // baseline already contains it) or, if the frozen `commit` were used
+    // instead, re-report a kept smell on every later experiment forever.
+    let leads_base = o.baseline.measure_commit.clone();
     let (result, measurements) = pipeline::eval(&mut o, log)?;
+
+    // Hints, never a verdict: the same syntactic leads the idea bank names,
+    // but pointed at lines this candidate introduced, so the agent does not
+    // have to reread its own diff to find them. A failure to produce them
+    // (git unreadable, odd working tree) is reported as `leads_error` rather
+    // than failing an experiment that already has a verdict.
+    let matcher = scope::Matcher::new(&o.cfg.scope);
+    // Named `lead_list`, not `leads`: `leads` is the module this came from,
+    // and shadowing it here makes the two read as one thing.
+    let (lead_list, leads_error) = match leads::for_changes(&root, &leads_base, &matcher) {
+        Ok(found) => (found, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
 
     // Informational only, and never gates this experiment's own verdict:
     // `stop` (Task 19) asks the agent to end the loop AFTER the experiment
@@ -191,6 +211,15 @@ fn eval(args: &Args) -> Result<i32, String> {
             }
             map.insert("stop_requested".to_string(), json!(stop_requested));
             map.insert("run".to_string(), run_obj);
+            // Omitted when empty, like `warnings`/`regressions`: an empty
+            // array would read as "we looked and found nothing", which is
+            // true but easy to mistake for a promise the hints are complete.
+            if !lead_list.is_empty() {
+                map.insert("leads".to_string(), lead_rows(&lead_list));
+            }
+            if let Some(e) = &leads_error {
+                map.insert("leads_error".to_string(), json!(e));
+            }
         }
         println!("{value}");
     } else {
@@ -210,8 +239,21 @@ fn eval(args: &Args) -> Result<i32, String> {
         }
         if let Some(m) = &measurements {
             for d in &m.time {
+                // Percentile bounds are only worth printing when they exist:
+                // a NaN interval would render as "NaN%", which reads like a
+                // measurement rather than a missing one.
+                let interval = if d.ci_low.is_finite() && d.ci_high.is_finite() {
+                    format!(
+                        ", {:.0}% CI {:+.1}% .. {:+.1}%",
+                        stats::CONFIDENCE * 100.0,
+                        d.ci_low,
+                        d.ci_high
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
-                    "  {}: {:.1} ns -> {:.1} ns ({:+.2}%, p={:.4}{})",
+                    "  {}: {:.1} ns -> {:.1} ns ({:+.2}%, p={:.4}{interval}{})",
                     d.name,
                     d.base_center,
                     d.cand_center,
@@ -225,12 +267,44 @@ fn eval(args: &Args) -> Result<i32, String> {
                 );
             }
         }
+        for lead in &lead_list {
+            let function = if lead.function.is_empty() {
+                "<module>"
+            } else {
+                &lead.function
+            };
+            println!(
+                "LEAD: {}:{} {function} ({}): {}",
+                lead.file, lead.line, lead.kind, lead.message
+            );
+        }
+        if let Some(e) = &leads_error {
+            println!("NOTE: lead scan failed: {e}");
+        }
         if stop_requested {
             println!("NOTE: a stop has been requested — end the loop after this experiment");
         }
     }
 
     Ok(result.exit_code())
+}
+
+/// One row per lead: what the agent should weigh, and where it was written.
+fn lead_rows(leads: &[leads::Lead]) -> serde_json::Value {
+    serde_json::Value::Array(
+        leads
+            .iter()
+            .map(|l| {
+                json!({
+                    "kind": l.kind,
+                    "file": l.file,
+                    "line": l.line,
+                    "function": l.function,
+                    "message": l.message,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// One row per measured benchmark for the JSON verdict.
@@ -248,7 +322,7 @@ fn benchmark_rows(deltas: &[rustperf_core::bench::Delta]) -> serde_json::Value {
         deltas
             .iter()
             .map(|d| {
-                json!({
+                let mut row = json!({
                     "name": d.name,
                     "base_ns": d.base_center,
                     "cand_ns": d.cand_center,
@@ -258,7 +332,17 @@ fn benchmark_rows(deltas: &[rustperf_core::bench::Delta]) -> serde_json::Value {
                     "keep_threshold_p": d.alpha / k,
                     "n_base": d.n_base,
                     "n_cand": d.n_cand,
-                })
+                });
+                // Omitted rather than serialized as `null` when not finite:
+                // serde_json turns NaN into null, and a parser cannot tell
+                // that apart from a key that was never there.
+                if d.ci_low.is_finite() && d.ci_high.is_finite() {
+                    if let serde_json::Value::Object(map) = &mut row {
+                        map.insert("ci_low".to_string(), json!(d.ci_low));
+                        map.insert("ci_high".to_string(), json!(d.ci_high));
+                    }
+                }
+                row
             })
             .collect(),
     )
@@ -272,4 +356,48 @@ fn enum_str<T: serde::Serialize>(v: &T) -> String {
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustperf_core::bench::Delta;
+
+    fn delta(name: &str, ci_low: f64, ci_high: f64) -> Delta {
+        Delta {
+            name: name.to_string(),
+            base_center: 100.0,
+            cand_center: 90.0,
+            ratio: 0.9,
+            pct_change: -10.0,
+            p: 0.01,
+            alpha: 0.05,
+            significant: true,
+            n_base: 6,
+            n_cand: 6,
+            ci_low,
+            ci_high,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn benchmark_rows_carry_a_finite_interval() {
+        let rows = benchmark_rows(&[delta("a", -14.0, -6.0)]);
+        let row = &rows.as_array().expect("rows is an array")[0];
+        assert_eq!(row["ci_low"], json!(-14.0), "{row}");
+        assert_eq!(row["ci_high"], json!(-6.0), "{row}");
+    }
+
+    // serde_json renders NaN as `null`, which a parser cannot tell apart from
+    // a missing key. A non-finite interval is therefore left out entirely
+    // rather than reported as an interval nobody measured.
+    #[test]
+    fn benchmark_rows_omit_a_non_finite_interval() {
+        let rows = benchmark_rows(&[delta("a", f64::NAN, f64::NAN)]);
+        let row = &rows.as_array().expect("rows is an array")[0];
+        assert!(row.get("ci_low").is_none(), "{row}");
+        assert!(row.get("ci_high").is_none(), "{row}");
+        assert_eq!(row["p"], json!(0.01), "{row}");
+    }
 }

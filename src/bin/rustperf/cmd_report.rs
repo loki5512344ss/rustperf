@@ -2,7 +2,10 @@
 
 use crate::args::Args;
 use rustperf_core::gitx;
+use rustperf_core::noise;
 use rustperf_core::results::{self, Row};
+use rustperf_core::state;
+use std::path::Path;
 
 pub fn run(argv: &[String]) -> i32 {
     let args = match Args::parse(argv, &[("C", true), ("json", false)]) {
@@ -27,13 +30,43 @@ pub fn run(argv: &[String]) -> i32 {
 fn report(args: &Args) -> Result<String, String> {
     let root = gitx::root(&args.dir())?;
     let rows = results::load(&root.join(results::RESULTS_PATH))?;
+    let floors = noise_floors(&root);
     if args.flag("json") {
-        let mut text = serde_json::to_string_pretty(&report_json(&rows))
-            .map_err(|e| format!("encode report: {e}"))?;
+        let mut value = report_json(&rows);
+        // Present only when data exists, exactly as in `status --json`.
+        if let Some(floors) = &floors {
+            value["noise"] = noise::rows_json(floors, noise::min_effect_pct(&root));
+        }
+        let mut text =
+            serde_json::to_string_pretty(&value).map_err(|e| format!("encode report: {e}"))?;
         text.push('\n');
         return Ok(text);
     }
-    Ok(format_report(&rows))
+    let mut text = format_report(&rows);
+    if let Some(floors) = &floors {
+        text.push_str(&noise::report_block(floors, noise::min_effect_pct(&root)));
+    }
+    Ok(text)
+}
+
+/// The run's per-benchmark noise floors, when the current branch names a run
+/// with enough measured experiments behind it.
+///
+/// `None` — never an error — when the tag cannot be resolved or the file
+/// cannot be read. `report` summarizes `results.tsv`, which needs no run
+/// branch, so the noise section is a bonus that must not turn a useful
+/// report on an unrelated branch into a failure; the same reasoning applies
+/// to a state directory this process cannot read.
+fn noise_floors(root: &Path) -> Option<Vec<noise::Floor>> {
+    let branch = gitx::current_branch(root).ok()?;
+    let tag = state::tag_from_branch(&branch)?;
+    let dir = state::state_dir(root, &tag).ok()?;
+    let floors = noise::floors(&dir).ok()?;
+    if floors.is_empty() {
+        None
+    } else {
+        Some(floors)
+    }
 }
 
 /// The same summary as [`format_report`], as one JSON object, for a caller

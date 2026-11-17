@@ -10,6 +10,19 @@ fn ready(tag: &str) -> TestRepo {
     repo
 }
 
+/// Writes `noise.jsonl` into the run's state directory as the harness would,
+/// one record per value.
+fn write_noise(dir: &std::path::Path, name: &str, pcts: &[f64]) {
+    let mut text = String::new();
+    for &pct in pcts {
+        text.push_str(&format!(
+            "{{\"benchmarks\":[{{\"name\":\"{name}\",\"noise_pct\":{pct},\
+             \"base_ns\":44702.0,\"cand_ns\":38636.0,\"n\":10}}]}}\n"
+        ));
+    }
+    std::fs::write(dir.join("noise.jsonl"), text).expect("write noise history");
+}
+
 #[test]
 fn status_reports_the_run_and_writes_nothing() {
     let repo = ready("t1");
@@ -149,4 +162,73 @@ fn status_json_reports_the_run_as_one_object_and_writes_nothing() {
     let out = common::run_cli(&repo, &["status", "--json"]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["stop_requested"], true);
+}
+
+// H1: `status` reports the per-benchmark noise floor after the experiments
+// line, with the `min_effect_pct` comparison, and the same facts in `--json`.
+#[test]
+fn status_reports_the_noise_floor_and_flags_min_effect_below_it() {
+    let repo = ready("t1");
+    let dir = common::state_dir(&repo, "t1");
+    write_noise(&dir, "count_words", &[1.0, 2.0, 3.0, 4.0]);
+
+    let text = String::from_utf8_lossy(&common::run_cli(&repo, &["status"]).stdout).into_owned();
+    // Median of [1,2,3,4], not the mean: 2.50 %.
+    assert!(
+        text.contains("noise floor    count_words ±2.50 % over 4 evals"),
+        "{text}"
+    );
+    assert!(
+        text.contains("min_effect_pct 1.0 % is below it"),
+        "a 2.5 % floor is above the default 1 % threshold:\n{text}"
+    );
+    // The noise line sits after the experiments line, not floating free.
+    let experiments = text.find("experiments").expect("an experiments line");
+    let noise = text.find("noise floor").expect("a noise line");
+    assert!(experiments < noise, "{text}");
+
+    let out = common::run_cli(&repo, &["status", "--json"]);
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");
+    assert_eq!(v["noise"][0]["benchmark"], "count_words");
+    assert_eq!(v["noise"][0]["experiments"], 4);
+    assert_eq!(v["noise"][0]["min_effect_below"], true);
+}
+
+// No data yet is not an empty array: the key is left out entirely, so a
+// parser cannot read "nothing measured" as "measured, found no noise".
+#[test]
+fn status_json_omits_the_noise_key_without_data() {
+    let repo = ready("t1");
+    let out = common::run_cli(&repo, &["status", "--json"]);
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");
+    assert!(v.get("noise").is_none(), "{v}");
+
+    let text = String::from_utf8_lossy(&common::run_cli(&repo, &["status"]).stdout).into_owned();
+    assert!(!text.contains("noise floor"), "{text}");
+}
+
+// Reading the noise history must not write anything, like every other line
+// `status` prints.
+#[test]
+fn status_with_a_noise_history_still_writes_nothing() {
+    let repo = ready("t1");
+    let dir = common::state_dir(&repo, "t1");
+    write_noise(&dir, "count_words", &[1.0, 2.0, 3.0, 4.0]);
+
+    let before = common::tree_snapshot(repo.path());
+    let noise_before = std::fs::read(dir.join("noise.jsonl")).unwrap();
+    assert!(common::run_cli(&repo, &["status"]).status.success());
+    assert!(
+        common::run_cli(&repo, &["status", "--json"])
+            .status
+            .success()
+    );
+    assert_eq!(common::tree_snapshot(repo.path()), before);
+    assert_eq!(
+        std::fs::read(dir.join("noise.jsonl")).unwrap(),
+        noise_before,
+        "status must only ever read the noise history"
+    );
 }

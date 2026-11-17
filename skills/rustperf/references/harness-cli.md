@@ -119,10 +119,20 @@ Facts that bite:
 - **Fork addition:** whenever measurement ran (KEEP and DISCARD), the object
   carries `benchmarks`: one row per benchmark with `name`, `base_ns`,
   `cand_ns` (medians), `pct_change`, `p`, `significant` (raw alpha),
-  `keep_threshold_p` (`alpha/k`, the bar a KEEP needs), `n_base`, `n_cand`.
-  Absent on FAIL/CRASH/ABORTED — nothing was measured. Use it to tell "one
+  `keep_threshold_p` (`alpha/k`, the bar a KEEP needs), `n_base`, `n_cand`,
+  and — when finite — `ci_low`/`ci_high`, the 2.5 %/97.5 % percentile
+  bootstrap interval for `pct_change` in percent units (2000 resamples of the
+  median ratio, fixed seed, no dependency). Absent on FAIL/CRASH/ABORTED —
+  nothing was measured. Use it to tell "one
   benchmark moved 8 %" from "everything moved 1 %". Upstream 0.2.1 has no
   such key; `results.tsv` still carries only `best_bench_delta`.
+- **Fork addition:** `leads` is present when the candidate introduced a
+  syntax-level smell in an in-scope source file; one row per occurrence with
+  `kind`, `file`, `line`, `function`, `message`. Kinds: `format_in_loop`,
+  `to_string_in_loop`, `clone_in_loop`, `collect_in_loop`,
+  `map_contains_then_insert`, `collect_then_iterate`. Omitted when empty;
+  `leads_error` replaces it when the scan failed. Hints only — no effect on
+  the verdict.
 - `run.experiment` on `ABORTED` is the pre-existing row count (no row written).
 - Score `0.0` for any gate failure or ABORTED.
 
@@ -230,6 +240,11 @@ Do not touch it. A human may set the env var for containers.
 - Do not redirect/tee stdout of `eval --json`; it prints one JSON object.
 - Print the context line before each experiment:
   `[exp <n> | <branch> | vs <measure_commit> | stop: rustperf stop]`
+- `status --json` and `report --json` carry `noise` when the run has at
+  least four measured experiments per benchmark: one row per benchmark with
+  `benchmark`, `experiments`, `noise_pct` (robust MAD sigma of the pinned
+  baseline's rounds, percent) and `min_effect_below` (omitted when the
+  config could not be read). Advisory, never a gate.
 - `stop_requested: true` or `ABORTED` → apply the verdict, run `report`,
   summarize, exit the loop.
 - Never edit `program.md`, `.rustperf/config.yaml`, `results.tsv`, or run

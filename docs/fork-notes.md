@@ -65,6 +65,9 @@ Added on 2026-11-17, from the Rust 1.100 changelog (`docs/fork-plan.md` § F):
 | toolchain age check | `doctor::toolchain_age` | warns when the compiler was released less than 7 days ago, and mentions `--jobs-frontend` on nightly |
 | weekly slow tests | `.github/workflows/ci.yml` | `schedule` + `workflow_dispatch` run the four `#[ignore]`d end-to-end tests, which no push/PR job executed |
 | forced-stop escalation | `procgroup_unix.rs`, `runner.rs`, `cmd_stop.rs` | after the 10 s grace, `stop --force` SIGKILLs the benchmark group the eval recorded, then the eval, then clears its claim; the record is a per-eval pid file in the temp dir, written on spawn and removed on every exit path |
+| bootstrap interval | `stats.rs`, `bench.rs`, `cmd_eval.rs` | every benchmark row gains `ci_low`/`ci_high`: 2.5 %/97.5 % percentile bootstrap of the median ratio, 2000 resamples, fixed seed, no dependency; omitted when not finite |
+| noise floor | `noise.rs`, `pipeline.rs`, `cmd_status.rs`, `cmd_report.rs` | one JSONL record per measured experiment on the baseline side; `status`/`report` show robust MAD sigma per benchmark from 4 experiments and flag `min_effect_pct` below it |
+| leads detector | `src/leads.rs`, `cmd_eval.rs` | `eval --json` gains `leads`: new `format!`/`to_string`/`clone`/`collect` in a loop, `contains_key`+`insert`, `collect` then one `for`, in the changed in-scope sources only; a hint, never a verdict |
 | 1.100 idea bank | `templates/program.md` | `trim_prefix`/`trim_suffix`, `Vec::from_fn`, `bool::toggle`, `Box::map`/`Arc::map`, `Result<T, !>`, arena on `Allocator` — each with the MSRV/lifetime caveat |
 
 

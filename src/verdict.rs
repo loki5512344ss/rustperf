@@ -286,6 +286,8 @@ mod tests {
             significant: p < 0.05,
             n_base: 10,
             n_cand: 10,
+            ci_low: pct - 1.0,
+            ci_high: pct + 1.0,
             warnings: Vec::new(),
         }
     }

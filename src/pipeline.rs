@@ -11,6 +11,7 @@ use crate::discover;
 use crate::freeze::{self, FreezeError};
 use crate::gitx;
 use crate::measure;
+use crate::noise;
 use crate::results;
 use crate::scope;
 use crate::state::{self, Baseline};
@@ -604,6 +605,20 @@ pub fn eval(
     // 11-12. Score.
     let deltas = bench::compare_all(&base_set, &cand_set)?;
     let score = bench::geomean(&deltas)?;
+
+    // 12b. Record this experiment's noise floor, from the BASELINE side's raw
+    //      rounds alone. `noise::noise_pct` turns those rounds into the
+    //      standard error of their median at this round count, so raising
+    //      `count` lowers the floor. Advisory: it never feeds the verdict, and
+    //      a failed write must not cost a measurement that already succeeded,
+    //      so it is a warning in the run log rather than an error. Appended once
+    //      per measured experiment — KEEP and DISCARD alike — and never reached
+    //      by FAIL/CRASH/ABORTED, which return before measurement completes.
+    if let Err(e) = noise::record(&o.state_dir, &base_set, &deltas) {
+        if let Some(log) = reborrow_log(&mut log) {
+            let _ = writeln!(log, "warning: could not record the noise floor: {e}");
+        }
+    }
 
     // 13. Decide.
     let result = verdict::decide(verdict::Input {

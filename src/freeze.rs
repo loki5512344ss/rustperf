@@ -734,7 +734,7 @@ fn extract_path_attr(attrs: &[syn::Attribute]) -> Option<String> {
 /// any ordinary edit to the code it guards; walking the tree instead lets
 /// `not(...)` suppress whatever is nested inside it, so only a `test` that
 /// actually has to hold for the item to compile counts.
-fn is_cfg_test(attr: &syn::Attribute) -> bool {
+pub(crate) fn is_cfg_test(attr: &syn::Attribute) -> bool {
     if !attr.path().is_ident("cfg") {
         return false;
     }
@@ -779,7 +779,7 @@ fn meta_mentions_test(meta: &syn::Meta) -> bool {
 /// itself could not interpret) carries no attributes this function can see,
 /// which is the fail-safe direction: such an item is never mistaken for test
 /// material, but it also can never be *exempted* from a hash by omission.
-fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+pub(crate) fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
     match item {
         syn::Item::Const(i) => &i.attrs,
         syn::Item::Enum(i) => &i.attrs,

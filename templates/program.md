@@ -134,11 +134,22 @@ with (at least) these fields:
       "base_ns": 44702.0,
       "cand_ns": 38636.0,
       "pct_change": -13.57,
+      "ci_low": -15.0,
+      "ci_high": -12.2,
       "p": 0.00001,
       "significant": true,
       "keep_threshold_p": 0.025,
       "n_base": 10,
       "n_cand": 10
+    }
+  ],
+  "leads": [
+    {
+      "kind": "format_in_loop",
+      "file": "src/parse.rs",
+      "line": 42,
+      "function": "parse_line",
+      "message": "format! allocates once per iteration; write into a reused String with write! (std::fmt::Write), or hoist the formatting out of the loop"
     }
   ],
   "stop_requested": false,
@@ -169,9 +180,31 @@ before choosing the next experiment: `pct_change` is the change in the median
 `keep_threshold_p` is the bar at least one benchmark has to clear for a
 `KEEP`. One benchmark at -8% with the rest flat is a different situation from
 every benchmark at -1%, and the single `score` cannot tell you which you have.
+`ci_low`/`ci_high` are a percentile bootstrap interval for `pct_change`, in
+the same percent units: 2000 resamples of the median ratio, 2.5 %/97.5 %.
+It says how wide the effect still is at this number of rounds, so `-13.57 %
+[-15.0, -12.2]` and `-13.57 % [-13.7, -13.4]` are different claims even
+though the point estimate is identical. (The numbers in the example above are
+illustrative; the case study's real ranges are in `docs/case-study.md`.) With few rounds the interval is wide
+by construction; that is the honest reading, not a bug. The keys are omitted
+when the interval could not be computed.
+
 The key is absent on `FAIL`, `CRASH` and `ABORTED`, where nothing was
 measured, and `regressions` and `warnings` are omitted when empty — do not
 require any of the three.
+
+`leads` is a fork addition: syntactic hints about lines THIS candidate
+introduced. They are found by scanning the changed in-scope sources and
+subtracting patterns the baseline already had, so a repository that always had
+a `format!` in a loop does not nag on every experiment. Kinds are stable
+strings — `format_in_loop`, `to_string_in_loop`, `clone_in_loop`,
+`collect_in_loop`, `map_contains_then_insert`, `collect_then_iterate` — and
+each row names the file, line and enclosing function. A lead never changes a
+verdict, is omitted when empty, and `leads_error` appears instead when the scan
+itself failed. Treat a lead as a question, not a finding: `clone()` in a loop
+is sometimes the right call, and an allocating closure inside an iterator chain
+is not detected at all. Before rewriting code, check that `rustperf profile`
+names the function the lead points at.
 
 Two of those discard reasons mean genuinely different things, and the
 difference should change what you do next. `no_significant_improvement`
@@ -260,6 +293,19 @@ treat any FAIL (`git reset --hard HEAD~1`), then stop as above.
 If the human wants the run to continue after all, they clear the request with
 `rustperf stop --clear`. That is their decision, not something to
 wait for or ask about.
+
+## The noise floor
+
+`rustperf status` (up to three rows, then `and N more`) and `rustperf report`
+(all of them) show a `noise floor` per benchmark once four measured
+experiments have covered it: how far the median the verdict compares can move
+between measurements at this round count, as a percentage — the robust
+round-to-round sigma scaled by `1.2533/sqrt(n)`. It answers "could this run even
+see the change I am asking for". When `min_effect_pct` is below that floor,
+the line says so: a run whose median moves ±2 % cannot honestly bank a 1 %
+improvement. Raising `count` lowers the floor with `1/sqrt(n)`; raising
+`min_effect_pct` stops banking wins this run cannot resolve. The floor is
+advisory: it changes no verdict and no threshold.
 
 ## Logging
 
