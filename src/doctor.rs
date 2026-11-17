@@ -931,7 +931,11 @@ mod tests {
     fn a_malformed_cargo_config_is_flagged_naming_the_path() {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join(".cargo")).unwrap();
-        let path = d.path().join(".cargo/config.toml");
+        // Two joins, not one `.cargo/config.toml` component: production builds
+        // the candidate path the same way, and on Windows a single component
+        // keeps its forward slash while the two-join path renders with
+        // backslashes, so the containment assertion compares like with like.
+        let path = d.path().join(".cargo").join("config.toml");
         std::fs::write(&path, "not valid toml [[[").unwrap();
         let c = dependency_cooldown_at(d.path(), None, None);
         assert!(!c.ok, "{}", c.detail);

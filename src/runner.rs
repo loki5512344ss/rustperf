@@ -312,6 +312,10 @@ mod tests {
     /// The temp file `Runner::cargo` records its child in, spelled out here
     /// rather than imported so the test pins the agreed location and name
     /// (`stop --force` in another process has to find it by the same rule).
+    ///
+    /// Unix only: on Windows the record protocol is a no-op (the process tree
+    /// is torn down by the job object instead), so nothing writes this file.
+    #[cfg(unix)]
     fn child_record_path() -> PathBuf {
         std::env::temp_dir().join(format!("rustperf-eval-{}.child", std::process::id()))
     }
@@ -353,6 +357,7 @@ mod tests {
     // command in this process must not inherit it, and must remove it on
     // every exit path — otherwise `stop --force` would later SIGKILL a group
     // that has nothing to do with this run.
+    #[cfg(unix)]
     #[test]
     fn a_completed_command_does_not_leave_a_stale_child_record_behind() {
         let _guard = spawn_guard();
