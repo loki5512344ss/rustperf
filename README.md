@@ -19,7 +19,7 @@ live inside the files being changed, and where **correctness is not
 optional**.
 
 > **Status: early but working.** This release is proven by its own test
-> suite — 435 tests in this fork (431 by default plus four `--ignored`
+> suite — 470 tests in this fork (466 by default plus four `--ignored`
 > end-to-end benchmark tests), including tests that drive `eval` to a real
 > `KEEP` and a real `DISCARD` against the bundled demo crate — by one real
 > measured run against that crate, recorded in full in
@@ -280,6 +280,8 @@ special: clear any pending stop and point the agent back at `program.md`.
 | `status` | Prints where a run is: run branch and whether it is checked out, the frozen baseline commit and the advancing measurement commit, the pinned worktree, how many experiments have run and with what verdicts, and whether a stop is pending. Read-only. Accepts `--tag <tag>` so it works from any branch. |
 | `stop` | Asks the agent to end the run after the experiment it is running: writes a request `eval` reports back as `stop_requested`. `--clear` cancels a pending request; `--force` additionally signals the running `eval` to abandon the current experiment and reports what state that leaves the repository in. Accepts `--tag <tag>`. |
 | `report` | Summarizes `results.tsv`: counts by status, the cumulative speedup as the product of every kept experiment's score, and the largest individual wins. |
+| `request "<text>" [--kind <k>]` | Records a need the gates refuse the agent — a dependency, a global allocator, `unsafe`, compiler flags — in the run's state directory; the kinds are `allocator`, `dependency`, `unsafe`, `flags` and `other`. Lifts no gate; `status` counts the queue and `report` prints it. |
+| `allocs` | Runs the declared benchmarks with criterion's `--profile-time` and reads the `RUSTPERF_ALLOCS` line a provisioned benchmark prints, reporting `allocs/op` and `bytes/op`. Read-only: no `results.tsv`, no verdict, and a benchmark that does not report is marked "not provisioned" rather than guessed. It measures the current working tree, not the pinned baseline worktree. |
 | `version` | Prints which build of the harness is running: the crate version for an installed binary, or the commit for one built from a checkout (marked `dirty` when the tree had uncommitted changes). A `results.tsv` row is only as reproducible as the binary that produced it. |
 
 Every command accepts `-C <dir>` to run against a repository other than the
@@ -423,7 +425,8 @@ largest wins:
 ```
 
 There are no `B/op`/`allocs/op` rows in this table the way the Go worked
-example has them — criterion measures wall-clock time only. See
+example has them — criterion measures wall-clock time only. `rustperf allocs`
+reports them separately, for a benchmark that opts in. See
 [Limitations](#limitations) for what that costs.
 
 ## What the harness enforces
@@ -606,18 +609,25 @@ None of these is cosmetic, and none of them is going to change soon.
   compile only becomes the larger cost on a crate whose dependency graph is
   unusually large *and* where every experiment invalidates the debug profile.
 
-- **No allocation metrics at all.** Go gets `B/op` and `allocs/op` free from
-  `-benchmem`. Criterion measures time only, and counting allocations would
-  mean installing a `#[global_allocator]` in the user's benchmark
-  harness — editing the very code under measurement. So `results.tsv` drops
-  the `allocs_delta` column and carries six fields, where the sixth is the
-  `rustperf` version that wrote the row (so a log spanning a tool upgrade is
-  still readable).
+- **No automatic allocation metrics.** Go gets `B/op` and `allocs/op` free
+  from `-benchmem`. Criterion measures time only, and an outside counter
+  cannot turn a process-wide total into a per-operation number because
+  neither criterion nor divan publishes the iteration count it measured. So
+  the fork takes the honest route instead: a benchmark the human provisioned
+  once (a counting `#[global_allocator]` plus a line on stderr — see
+  `benchmarks/allocs/`) reports `RUSTPERF_ALLOCS benchmark=… allocs=…
+  bytes=… iters=…`, and `rustperf allocs [--json]` prints `allocs/op` and
+  `bytes/op` for the declared benchmarks. The command is read-only, a
+  repository that has not opted in gets "not provisioned" rather than a
+  guessed number, and none of it enters `results.tsv` or a verdict: the log
+  still has six fields, the sixth being the `rustperf` version that wrote the
+  row (so a log spanning a tool upgrade is still readable).
 
-  This costs more than a column. An allocation count is often an agent's
-  single best lead for *what to try next* — "this loop allocates 400 times
-  per call" localizes a problem that a wall-clock number does not. The idea
-  bank in `program.md` had to be built around what remains instead — `samply`'s hot
+  This costs more than a column. When it is provisioned, an allocation count
+  is often an agent's single best lead for *what to try next* — "this loop
+  allocates 400 times per call" localizes a problem that a wall-clock number
+  does not. When it is not, the idea bank in `program.md` is built around what
+  remains — `samply`'s hot
   symbols, plus Rust-specific leads: `String`/`Vec` reallocation and
   `with_capacity`, `clone()` in hot paths, `collect()` into an intermediate
   collection, `Box<dyn Trait>` dynamic dispatch vs generics, iterator chains
@@ -647,6 +657,11 @@ None of these is cosmetic, and none of them is going to change soon.
   proc macro. Upstream has no such gate. Set `allow_unsafe: true` in
   `.rustperf/config.yaml` to disable the gate (human-only; default
   `false`).
+- **The request queue is a note, not a workflow engine.** `rustperf request`
+  writes into the current run's state directory, has no "granted" state, and
+  nothing verifies that the human acted on it; a new `baseline` starts an
+  empty queue. It exists so an agent stops spending experiments on changes
+  the gates will refuse, not to automate provisioning.
 - **The noise floor needs history, and it is per run.** It is computed from
   this run's own `noise.jsonl` in the state directory, so the first three
   measured experiments show nothing and a new `baseline` starts over. It
@@ -707,6 +722,25 @@ This branch is a fork. In addition to the upstream harness, it adds:
   `min_effect_pct` is below it — the run cannot honestly see a change that
   small. Raising `count` lowers the floor by `1/sqrt(n)`. Both are advisory and
   change no verdict.
+- **A queue of requests to the human (2026-11-17).** `rustperf request "<text>"
+  [--kind allocator|dependency|unsafe|flags|other]` records that the next
+  experiment needs something the gates refuse the agent — a new crate, a
+  global allocator, an arena, `unsafe`, compiler flags. It appends to the
+  run's state directory, lifts no gate, and appears in `status` (count) and
+  `report` (list, plus `--json`). The human either provisions the thing
+  before the next `baseline` (preferred) or sets `allow_unsafe`. The
+  optimization catalog now carries a matrix of what an agent may do itself
+  (index arenas, pools, hashers, iterators, buffer reuse) versus what needs
+  provisioning.
+- **Reproducible benchmarks and opt-in allocation telemetry (2026-11-17).**
+  `benchmarks/` holds three independent crates: `compare/` (ten side-by-side
+  groups with equality tests, so a fast wrong answer cannot win), `pgo/` (a
+  `run.sh` that replays the sample-PGO experiment in `docs/pgo-spike.md`,
+  refuses at `perf_event_paranoid > 1` and never calls `sudo`) and `allocs/`
+  (the counting-allocator example). `rustperf allocs [--json]` reads the
+  `RUSTPERF_ALLOCS` line a provisioned benchmark prints and reports
+  `allocs/op`/`bytes/op`; it writes nothing, never touches `results.tsv`, and
+  changes no verdict.
 - **`stop --force` escalates.** If `eval` has not released its claim 10
   seconds after `SIGTERM`, the recorded benchmark process group is
   `SIGKILL`ed, then `eval`, then its claim is cleared — instead of leaving a
@@ -730,7 +764,7 @@ skill details.
 Three things back this tool, and it is worth being precise about what each
 one does and does not establish.
 
-**Its own test suite** — 435 tests in this fork (431 by default plus four
+**Its own test suite** — 470 tests in this fork (466 by default plus four
 `--ignored` end-to-end benchmark tests, counted with
 `cargo test --all-targets -- --list`), including tests that drive `eval` to a
 real `KEEP` and a real `DISCARD` against the bundled `testdata/demo` crate.

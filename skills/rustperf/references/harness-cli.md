@@ -13,6 +13,8 @@ README. Where README and code disagree, this file follows the code and says so.
 | `eval` | `-C`, `--json`, `--desc <text>`, `--no-log` | one experiment: gates → build → test → measure → verdict → one `results.tsv` row |
 | `status` | `-C`, `--tag`, `--json` | read-only run state |
 | `stop` | `-C`, `--tag`, `--clear`, `--force` | graceful stop request; `--clear` cancels; `--force` aborts the in-flight eval |
+| `request` | `-C`, `--kind <K>`, `--list` | **fork addition.** records "the next experiment needs a human": `allocator`, `dependency`, `unsafe`, `flags`, `other` (default). Appends to `<state_dir>/requests.jsonl`; **lifts no gate**; `--list` prints the queue |
+| `allocs` | `-C`, `--json` | **fork addition.** runs each declared benchmark with `--profile-time 1` and parses `RUSTPERF_ALLOCS benchmark=… allocs=… bytes=… iters=…` the benchmark printed to stderr; prints `allocs/op` and `bytes/op`, or `not provisioned`. Read-only: no `results.tsv`, no run log, no verdict |
 | `report` | `-C`, `--json` | counts + cumulative speedup from `results.tsv` |
 | `profile` | `-C`, `--tag` | samply samples of the declared benches; needs `samply` |
 | `version` | — | binary version/commit |
@@ -214,7 +216,8 @@ Do not touch it. A human may set the env var for containers.
    hashes are keyed by path and a missing path fails closed by design, so the
    rename would look like deleted tests. Split a file by extracting into a new
    module and keeping the old one.
-4. No clippy, no Miri, no allocation metrics (median time only).
+4. No clippy, no Miri, no automatic allocation metrics: `allocs` reads an
+   opt-in protocol, and verdicts see median time only.
 5. `doctor` gates nothing; a throttling laptop still produces verdicts.
 6. The regression guard needs `p < 0.05` **or** a median slowdown of at least
    50 % (`verdict::LARGE_REGRESSION_PCT`). A 10–49 % regression measured with
@@ -240,11 +243,20 @@ Do not touch it. A human may set the env var for containers.
 - Do not redirect/tee stdout of `eval --json`; it prints one JSON object.
 - Print the context line before each experiment:
   `[exp <n> | <branch> | vs <measure_commit> | stop: rustperf stop]`
+- `status --json` carries `requests: N` when the queue is non-empty;
+  `report --json` carries `requests: [{kind,text,commit,experiment}]` and the
+  text report prints a `requests for a human:` section. The queue is a note,
+  never an input to a verdict.
 - `status --json` and `report --json` carry `noise` when the run has at
   least four measured experiments per benchmark: one row per benchmark with
   `benchmark`, `experiments`, `noise_pct` (robust MAD sigma of the pinned
   baseline's rounds, percent) and `min_effect_below` (omitted when the
   config could not be read). Advisory, never a gate.
+- `rustperf allocs` is a lead, not evidence: it exits 0 when it ran, even if
+  every row says "not provisioned"; exit 2 means cargo could not run a
+  benchmark (a broken build, a timeout), which is a different problem. A
+  benchmark only has a number if the human provisioned it once, before
+  `baseline` (see `benchmarks/allocs/README.md`); never invent one.
 - `stop_requested: true` or `ABORTED` → apply the verdict, run `report`,
   summarize, exit the loop.
 - Never edit `program.md`, `.rustperf/config.yaml`, `results.tsv`, or run

@@ -1,0 +1,72 @@
+[package]
+name = "compare"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+description = "Visible A/B micro-benchmarks: both sides of each pair are plain, readable Rust."
+license = "MIT"
+
+# Every bench target is declared below; no implicit discovery, so helper files
+# under benches/ (support.rs) are not mistaken for benchmark binaries.
+autobenches = false
+
+[lib]
+name = "compare"
+path = "src/lib.rs"
+# The test target has no criterion harness; keep it out of `cargo bench` so the
+# criterion flags are not handed to libtest.
+bench = false
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "string_build"
+path = "benches/string_build.rs"
+harness = false
+
+[[bench]]
+name = "vec_growth"
+path = "benches/vec_growth.rs"
+harness = false
+
+[[bench]]
+name = "clone_vs_borrow"
+path = "benches/clone_vs_borrow.rs"
+harness = false
+
+[[bench]]
+name = "map_collect"
+path = "benches/map_collect.rs"
+harness = false
+
+[[bench]]
+name = "format_loop"
+path = "benches/format_loop.rs"
+harness = false
+
+[[bench]]
+name = "entry_vs_insert"
+path = "benches/entry_vs_insert.rs"
+harness = false
+
+[[bench]]
+name = "hashmap_hasher"
+path = "benches/hashmap_hasher.rs"
+harness = false
+
+[[bench]]
+name = "dyn_vs_generic"
+path = "benches/dyn_vs_generic.rs"
+harness = false
+
+[[bench]]
+name = "short_string"
+path = "benches/short_string.rs"
+harness = false
+
+[[bench]]
+name = "arena"
+path = "benches/arena.rs"
+harness = false

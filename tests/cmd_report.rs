@@ -193,3 +193,68 @@ fn report_omits_the_noise_section_off_a_run_branch() {
     assert!(text.contains("1 keep"), "{text}");
     assert!(!text.contains("noise floor"), "{text}");
 }
+
+/// Writes `requests.jsonl` into the run's state directory as `rustperf
+/// request` would.
+fn write_requests(dir: &std::path::Path, requests: &[(&str, &str, usize)]) {
+    let mut text = String::new();
+    for (kind, what, experiment) in requests {
+        text.push_str(&format!(
+            "{{\"kind\":\"{kind}\",\"text\":\"{what}\",\"commit\":\"abc1234\",\
+             \"experiment\":{experiment}}}\n"
+        ));
+    }
+    std::fs::write(dir.join("requests.jsonl"), text).expect("write requests");
+}
+
+// I2: the report lists what the agent asked a human to provision, in text and
+// in `--json`; with an empty queue there is no section and no key at all, and
+// a queue that cannot be read never fails the report.
+#[test]
+fn report_lists_requests_for_a_human() {
+    let repo = ready("t1");
+
+    // Nothing pending: no section, no key.
+    let text = String::from_utf8_lossy(&common::run_cli(&repo, &["report"]).stdout).into_owned();
+    assert!(!text.contains("requests for a human"), "{text}");
+    let out = common::run_cli(&repo, &["report", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");
+    assert!(v.get("requests").is_none(), "{v}");
+
+    let dir = common::state_dir(&repo, "t1");
+    write_requests(
+        &dir,
+        &[
+            ("allocator", "bumpalo for the parser arena", 3),
+            ("flags", "codegen-units=1", 4),
+        ],
+    );
+
+    let text = String::from_utf8_lossy(&common::run_cli(&repo, &["report"]).stdout).into_owned();
+    assert!(text.contains("requests for a human"), "{text}");
+    assert!(
+        text.contains("  [allocator] bumpalo for the parser arena (experiment 3, commit abc1234)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  [flags] codegen-units=1 (experiment 4, commit abc1234)"),
+        "{text}"
+    );
+
+    let out = common::run_cli(&repo, &["report", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");
+    assert_eq!(v["requests"][0]["kind"], "allocator");
+    assert_eq!(v["requests"][0]["text"], "bumpalo for the parser arena");
+    assert_eq!(v["requests"][0]["commit"], "abc1234");
+    assert_eq!(v["requests"][0]["experiment"], 3);
+    assert_eq!(v["requests"][1]["kind"], "flags");
+
+    // Advisory like the noise history: an unreadable queue is omitted, not an
+    // error that turns a useful report into a failure.
+    std::fs::remove_file(dir.join("requests.jsonl")).unwrap();
+    std::fs::create_dir(dir.join("requests.jsonl")).unwrap();
+    let out = common::run_cli(&repo, &["report"]);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(!text.contains("requests for a human"), "{text}");
+}

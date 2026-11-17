@@ -1,0 +1,13 @@
+[package]
+name = "pgo-demo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Allocation-bound word counter used to reproduce the sample-based PGO experiment in docs/pgo-spike.md"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "wordcount"
+harness = false

@@ -305,6 +305,10 @@ How to read it:
 ## 8. Allocation profiling
 
 Rust gives no allocation counts by default, and criterion measures time only.
+In this harness, a benchmark provisioned with a counting `#[global_allocator]`
+can report `RUSTPERF_ALLOCS benchmark=… allocs=… bytes=… iters=…` on stderr,
+and `rustperf allocs` turns that into `allocs/op`/`bytes/op`; the pattern is in
+`benchmarks/allocs/`.
 
 ```bash
 heaptrack ./target/release/app input.bin      # totals, peaks, call sites

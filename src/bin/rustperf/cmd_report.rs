@@ -3,6 +3,7 @@
 use crate::args::Args;
 use rustperf_core::gitx;
 use rustperf_core::noise;
+use rustperf_core::requests;
 use rustperf_core::results::{self, Row};
 use rustperf_core::state;
 use std::path::Path;
@@ -31,11 +32,15 @@ fn report(args: &Args) -> Result<String, String> {
     let root = gitx::root(&args.dir())?;
     let rows = results::load(&root.join(results::RESULTS_PATH))?;
     let floors = noise_floors(&root);
+    let pending = pending_requests(&root);
     if args.flag("json") {
         let mut value = report_json(&rows);
         // Present only when data exists, exactly as in `status --json`.
         if let Some(floors) = &floors {
             value["noise"] = noise::rows_json(floors, noise::min_effect_pct(&root));
+        }
+        if let Some(pending) = &pending {
+            value["requests"] = requests_json(pending);
         }
         let mut text =
             serde_json::to_string_pretty(&value).map_err(|e| format!("encode report: {e}"))?;
@@ -45,6 +50,9 @@ fn report(args: &Args) -> Result<String, String> {
     let mut text = format_report(&rows);
     if let Some(floors) = &floors {
         text.push_str(&noise::report_block(floors, noise::min_effect_pct(&root)));
+    }
+    if let Some(pending) = &pending {
+        text.push_str(&requests_block(pending));
     }
     Ok(text)
 }
@@ -67,6 +75,59 @@ fn noise_floors(root: &Path) -> Option<Vec<noise::Floor>> {
     } else {
         Some(floors)
     }
+}
+
+/// The pending requests to a human, when the current branch names a run that
+/// has any.
+///
+/// `None` — never an error — for exactly the reasons [`noise_floors`] gives:
+/// `report` summarizes `results.tsv` and needs no run branch, so a queue that
+/// cannot be located or read must not turn a useful report into a failure. A
+/// request is advisory anyway: the pipeline never reads it.
+fn pending_requests(root: &Path) -> Option<Vec<requests::Request>> {
+    let branch = gitx::current_branch(root).ok()?;
+    let tag = state::tag_from_branch(&branch)?;
+    let dir = state::state_dir(root, &tag).ok()?;
+    let pending = requests::load(&dir).ok()?;
+    if pending.is_empty() {
+        None
+    } else {
+        Some(pending)
+    }
+}
+
+/// The `requests for a human` section: every stored request, uncapped, one
+/// line each. Not capped for the same reason the noise section is not: a
+/// report is read deliberately, and a request nobody sees is a wasted
+/// experiment.
+fn requests_block(pending: &[requests::Request]) -> String {
+    if pending.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\nrequests for a human:\n");
+    for request in pending {
+        out.push_str(&format!("  {}\n", requests::describe(request)));
+    }
+    out
+}
+
+/// The same requests as JSON rows, for `report --json`. Field names match the
+/// struct, so a caller parses one shape regardless of which command read the
+/// queue.
+fn requests_json(pending: &[requests::Request]) -> serde_json::Value {
+    serde_json::Value::Array(
+        pending
+            .iter()
+            .map(|request| {
+                serde_json::json!({
+                    "kind": request.kind,
+                    "text": request.text,
+                    "commit": request.commit,
+                    "experiment": request.experiment,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// The same summary as [`format_report`], as one JSON object, for a caller
@@ -266,5 +327,41 @@ mod tests {
             text.to_lowercase().contains("no experiments were kept"),
             "{text}"
         );
+    }
+
+    fn request(kind: &str, text: &str, experiment: usize) -> requests::Request {
+        requests::Request {
+            kind: kind.into(),
+            text: text.into(),
+            commit: "abc1234".into(),
+            experiment,
+        }
+    }
+
+    #[test]
+    fn the_requests_section_lists_kind_text_experiment_and_commit() {
+        let text = requests_block(&[request("allocator", "bumpalo for the parser", 3)]);
+        assert!(text.contains("requests for a human:"), "{text}");
+        assert!(
+            text.contains("  [allocator] bumpalo for the parser (experiment 3, commit abc1234)"),
+            "{text}"
+        );
+    }
+
+    // An empty queue adds no header at all: a section that says "there are
+    // none" on every report is noise, and `status` already covers the normal
+    // case by saying nothing.
+    #[test]
+    fn an_empty_queue_adds_no_section() {
+        assert_eq!(requests_block(&[]), "");
+    }
+
+    #[test]
+    fn the_requests_json_rows_carry_all_four_fields() {
+        let v = requests_json(&[request("flags", "codegen-units=1", 1)]);
+        assert_eq!(v[0]["kind"], "flags");
+        assert_eq!(v[0]["text"], "codegen-units=1");
+        assert_eq!(v[0]["commit"], "abc1234");
+        assert_eq!(v[0]["experiment"], 1);
     }
 }

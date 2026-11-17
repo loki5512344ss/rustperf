@@ -14,7 +14,7 @@
 //! `eval --json`: `status --json` is for a human's tooling, not the loop.
 
 use crate::args::Args;
-use rustperf_core::{gitx, noise, results, state};
+use rustperf_core::{gitx, noise, requests, results, state};
 use std::path::Path;
 
 pub fn run(argv: &[String]) -> i32 {
@@ -118,6 +118,7 @@ fn status(args: &Args) -> Result<String, String> {
     }
     out.push_str(&experiments_line(&root));
     out.push_str(&noise_lines(&root, &dir));
+    out.push_str(&requests_line(&dir));
     out.push_str(&stop_lines(&dir));
     Ok(out)
 }
@@ -175,6 +176,14 @@ fn status_json(
             v["noise"] = noise::rows_json(&floors, noise::min_effect_pct(root));
         }
     }
+    // Same rule as `noise`: omitted while there is nothing pending, because
+    // `"requests": 0` would read as "the queue was read and is empty" even
+    // when the file could not be read at all.
+    if let Ok(pending) = requests::load(dir) {
+        if !pending.is_empty() {
+            v["requests"] = serde_json::json!(pending.len());
+        }
+    }
     let mut text = serde_json::to_string_pretty(&v).map_err(|e| format!("encode status: {e}"))?;
     text.push('\n');
     Ok(text)
@@ -213,6 +222,25 @@ fn noise_lines(root: &Path, dir: &Path) -> String {
     match noise::floors(dir) {
         Ok(floors) => noise::status_block(&floors, noise::min_effect_pct(root)),
         Err(e) => format!("{:<14} unavailable ({e})\n", "noise floor"),
+    }
+}
+
+/// How many requests to the human are waiting, read-only — the file is only
+/// ever opened for reading here, like the noise history above.
+///
+/// An unreadable file is reported as such rather than hidden, matching
+/// `experiments_line` and `noise_lines`: a human glancing at `status` must not
+/// be told the queue is empty when it could not be read. No line at all is
+/// printed while the queue is empty, which is the normal case.
+fn requests_line(dir: &Path) -> String {
+    match requests::load(dir) {
+        Ok(pending) if pending.is_empty() => String::new(),
+        Ok(pending) => format!(
+            "{:<14} {} pending — see 'rustperf report'\n",
+            "requests",
+            pending.len()
+        ),
+        Err(e) => format!("{:<14} unavailable ({e})\n", "requests"),
     }
 }
 

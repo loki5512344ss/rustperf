@@ -1,12 +1,14 @@
 use std::process::ExitCode;
 
 mod args;
+mod cmd_allocs;
 mod cmd_baseline;
 mod cmd_doctor;
 mod cmd_eval;
 mod cmd_init;
 mod cmd_profile;
 mod cmd_report;
+mod cmd_request;
 mod cmd_status;
 mod cmd_stop;
 mod cmd_version;
@@ -25,6 +27,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "profile",
         "profile the declared benchmarks and report hot spots",
     ),
+    (
+        "allocs",
+        "show allocations per operation for benchmarks that report them",
+    ),
     ("eval", "run one experiment step and return a verdict"),
     (
         "status",
@@ -33,6 +39,10 @@ const COMMANDS: &[(&str, &str)] = &[
     (
         "stop",
         "ask the agent to end the run after the current experiment",
+    ),
+    (
+        "request",
+        "record that the next experiment needs a human to provision something",
     ),
     ("report", "summarize results.tsv"),
     ("version", "print which build of the harness this is"),
@@ -62,9 +72,11 @@ fn dispatch(args: &[String]) -> i32 {
         "doctor" => cmd_doctor::run(rest),
         "baseline" => cmd_baseline::run(rest),
         "profile" => cmd_profile::run(rest),
+        "allocs" => cmd_allocs::run(rest),
         "eval" => cmd_eval::run(rest),
         "status" => cmd_status::run(rest),
         "stop" => cmd_stop::run(rest),
+        "request" => cmd_request::run(rest),
         "report" => cmd_report::run(rest),
         "version" => cmd_version::run(rest),
         _ => {

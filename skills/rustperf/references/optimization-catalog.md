@@ -96,7 +96,7 @@ small-N sweep decides (measured example: `examples.md` §8).
 | `b08-target-feature-avx2` | Explicit target-feature flags | E | fixed-fleet deployment with verified ISA. | E, contract — violating CPU requirements can make the program non-functional; wrong configuration can also produce incorrect code. |
 | `b09-pgo-profile-generate-use` | PGO | M | stable, typical workloads where branch frequency and block layout matter; production builds matched to real traffic. | a bad/unrepresentative profile makes other inputs slower — it must reflect the real event mix and input sizes; never reuse a profile from another program or binary version; clean old `.profraw` between experiments; check the LLVM tools match the rustc LLVM; two-phase build and profile drift over time. |
 | `b10-bolt-cargo-pgo` | BOLT / cargo-pgo | M | large production binaries with hot/cold code spread across the address space. | platform/toolchain-specific, needs separate measurement; can regress if profiles are stale. |
-| `b11-alternative-allocator` | Alternative allocator | M | allocation-heavy multithreaded services. | external dependency; memory footprint and tail latency can change in either direction. Only after DHAT/heaptrack proves allocator time. |
+| `b11-alternative-allocator` | Alternative allocator | M | allocation-heavy multithreaded services. | **human-provisioned only** — dependency and `unsafe impl GlobalAlloc`; external dependency; memory footprint and tail latency can change in either direction. Only after DHAT/heaptrack proves allocator time. |
 | `b12-fast-linker` | Fast linker | M | long link steps in CI. | mostly build-time, not runtime; OS/toolchain support varies. |
 | `b13-strip` | strip symbols/debuginfo (profile `strip` or post-build) | M | distribution size. | less diagnostic info, loses symbols/traceability; runtime effect is optional/incidental. |
 | `b14-debug-line-tables-only` | line-tables-only debug info while profiling | P | any sampling profile of a release build. | adds debug-section size only; not a runtime optimization. |
@@ -168,6 +168,33 @@ small-N sweep decides (measured example: `examples.md` §8).
 
 ## Allocations & ownership
 
+### Custom allocation in this harness — what the agent may actually do
+
+Rust allows allocator-level customization, but this harness locks
+`Cargo.toml`/`Cargo.lock` and fails any candidate that adds an `unsafe`
+region. Check this table before spending an experiment on an idea that the
+gate will refuse.
+
+| Idea | Agent may? | Why, and what to do instead |
+|---|---|---|
+| `mimalloc`/`jemalloc`/`snmalloc`/`talc` as `#[global_allocator]` | **no** | New dependency (locked) plus `unsafe impl GlobalAlloc` (unsafe gate). A human provisions it before `baseline`. |
+| Hand-written bump arena (`unsafe impl Allocator`) | **no** | Unsafe gate. A human adds it, or use the safe `d07` index arena. |
+| `Vec::with_capacity_in` / `Box::new_in` with an allocator the repo already has | yes | Safe use; adding the allocator type itself is still a human, pre-baseline step (`h15`). |
+| `bumpalo` / `typed-arena` / `slotmap` | only if already a dependency | `Cargo.toml` is locked; a new one is a human decision. |
+| `SmallVec` / `ArrayVec` / `compact_str` / `phf` | only if already a dependency | Same lock (`h12`, `h13`, `c32`). |
+| Index arena / freelist pool (`Vec<Node>` + `u32`) | yes | Safe code (`d07`, `h16`); no dependency needed. |
+| Custom `BuildHasher` / `Hasher` | yes | Safe (`c15`); keep the hash-flooding contract in mind. |
+| Custom `Iterator` with an accurate `size_hint` | yes | Safe (`h33`). |
+| `#[repr(align(N))]` to stop false sharing | yes | Safe (`d09`); costs memory and changes layout. |
+| Buffer reuse: `clear`/`drain`/`mem::take`/`clone_from`, pool returned in `Drop` | yes | Safe (`h03`, `h09`, `h19`, `h23`). |
+| `spare_capacity_mut` + `set_len` | **no** | `set_len` is unsafe, so the gate refuses it; use `extend`/`extend_from_slice` or a collect from an exact-size iterator (`h31` is E for a reason). |
+
+When the answer is "no", do not attempt the edit: run
+`rustperf request "<one line>" --kind allocator|dependency|unsafe|flags|other`
+and continue with an experiment that is inside the gates. The request does
+not lift anything; the human decides before the next `baseline`.
+
+
 | ID | Technique | Pri | When it pays | Check / when it hurts |
 |---|---|---|---|---|
 | `h01-with-capacity` | with_capacity | P | known/estimable output size with many pushes. | over-reserving raises RSS; with_capacity does not set len. |
@@ -183,8 +210,8 @@ small-N sweep decides (measured example: `examples.md` §8).
 | `h12-smallvec` | SmallVec | M | very many short-lived vectors. | bigger inline object, heap/inline branch on every op, expensive moves; not a guaranteed win. |
 | `h13-arrayvec` | ArrayVec | M | strict maximum size known. | overflow must be handled; size is fixed even when empty. |
 | `h14-array-plus-len` | Small array + length counter | M | small fixed buffers. | manual init/length logic; only initialized elements may be read. |
-| `h15-arena` | Arena / bump allocation | M | per-request/per-pass object graphs. | destructors, memory held until arena drop, cross-epoch references. |
-| `h16-object-pool` | Object pool / freelist | M | frequent create/destroy of the same shape. | retains memory, complicates concurrency and cleanup. |
+| `h15-arena` | Arena / bump allocation | M | per-request/per-pass object graphs. | **unsafe impl Allocator = human-provisioned only**; the safe route is `d07`; destructors, memory held until arena drop, cross-epoch references. |
+| `h16-object-pool` | Object pool / freelist | M | frequent create/destroy of the same shape. | safe when the pool is `Vec<Node>` + indices (`d07`), not raw pointers; retains memory, complicates concurrency and cleanup. |
 | `h17-vec-append` | Vec::append vs extend(drain) | M | transferring whole vectors. | source is emptied; order is preserved. |
 | `h18-extend-from-slice` | extend_from_slice | M | appending slices. | for Clone elements the clone semantics apply. |
 | `h19-mem-take-replace` | mem::take / mem::replace | M | swapping buffers/state. | the value left behind must be valid/sensible. |

@@ -325,10 +325,9 @@ commit	score	best_bench_delta	status	description	version
 
 (The last column is the `rustperf` version that wrote the row, filled in by
 the harness — the human needs it when a log spans a tool upgrade. There is
-no allocation column here — criterion measures wall-clock time only, and this
-harness has no way to count allocations without instrumenting the very code
-it measures. If you're looking for an allocation-count lead, see the idea
-bank below: it deliberately does not offer one.)
+no allocation column here — `eval` measures wall-clock time only. Allocation
+counts are a separate, opt-in diagnostic (`rustperf allocs`, see below), and
+they never enter this file or a verdict.)
 
 `commit`, `score`, `best_bench_delta`, and `status` are filled in by the
 harness from the verdict — you do not control them. The one column that is
@@ -411,20 +410,56 @@ Search rather than flail. Start from `rustperf profile`, not from a guess.
   use and the phase ends where the arena does; the clock has to show the win,
   because an arena that outlives its phase is a leak with a nicer name.
 
-Two notes specific to this harness. There are **no allocation counts** —
-criterion measures time only — so an allocation hypothesis has to be confirmed
-by the clock, not by a counter. And **`unsafe` is gated** against new or
-changed regions: `get_unchecked` will genuinely be faster and will genuinely
-pass the tests, but `eval` fails the experiment with `unsafe_added` before it
-is built, and the speed would be bought with undefined behaviour on any input
-the tests do not cover. Do not reach for it.
+Two notes specific to this harness. Allocation counts are **not automatic** —
+they exist only for a benchmark the human provisioned to report them
+(`rustperf allocs`), so an allocation hypothesis still has to be confirmed by
+the clock unless that report is available. And **`unsafe` is gated** against
+new or changed regions: `get_unchecked` will genuinely be faster and will
+genuinely pass the tests, but `eval` fails the experiment with
+`unsafe_added` before it is built, and the speed would be bought with
+undefined behaviour on any input the tests do not cover. Do not reach for it.
+
+## When the fix needs a human decision
+
+Some of the largest wins in the idea bank cannot be made by you, by design:
+
+- **`Cargo.toml` / `Cargo.lock` are locked.** A new crate (`bumpalo`,
+  `mimalloc`, `smallvec`, `phf`, …) fails the experiment before it is built.
+- **`unsafe` is gated** against new or changed regions: a hand-written
+  `Allocator`/`GlobalAlloc`, raw pointers, `set_len` — `FAIL(unsafe_added)`.
+- **Compiler flags and the toolchain are not yours**: `RUSTFLAGS`,
+  `-C target-cpu`, PGO profiles.
+
+Do not attempt them "just to see", and never edit a locked file. Record the
+need instead:
+
+```
+rustperf request "bump arena for the parse phase: ~40k allocations per parse" --kind allocator
+```
+
+Kinds are `allocator`, `dependency`, `unsafe`, `flags`, `other`;
+`rustperf request --list` shows what is already pending. The request is
+appended to the harness-owned queue in the run's state directory;
+`rustperf status` counts it and `rustperf report` prints it for the human. It
+lifts nothing: the human either provisions the dependency or allocator before
+the next `baseline` (the preferred route — then it is baseline code and you
+may use it safely), or sets `allow_unsafe: true` for the run (their call,
+off by default). Until then, keep going with the largest improvement that
+fits inside the gates; a queued request is not a reason to stop the loop.
+
+If the human has already provisioned a benchmark to report its own counters
+(see `benchmarks/allocs/README.md`), `rustperf allocs` prints `allocs/op` and
+`bytes/op` for the declared benchmarks. Use it to aim the next experiment, not
+to conclude one: an unprovisioned row says "not provisioned", and that is not
+permission to guess a number.
 
 ## What this harness cannot see, so don't rely on it
 
-- **No allocation counts anywhere in its output.** Not in `eval`'s result, not
-  in `profile`. Criterion measures wall-clock time only; an allocation
-  hypothesis is confirmed by whether the clock moved, never by a counter this
-  tool does not have.
+- **No automatic allocation counts.** Not in `eval`'s result, not in
+  `profile`. They exist only when the human provisioned a benchmark to print
+  `RUSTPERF_ALLOCS` lines, and `rustperf allocs` reads those; an unprovisioned
+  repository gets "not provisioned", never a guessed number. Even when
+  present, a count is a lead, not evidence a verdict may rest on.
 - **No lint gate.** Clippy is not run as a gate here — it is far too
   opinionated to force on an arbitrary repository. Passing or failing clippy
   has no bearing on any verdict.

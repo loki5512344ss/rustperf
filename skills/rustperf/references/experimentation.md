@@ -147,7 +147,9 @@ the benchmark until something passes.
 - `KEEP` advances the measurement baseline. For fair variant comparison,
   measure every variant against the *frozen* baseline, then apply the winner
   to the branch as one commit.
-- The harness has no allocation metrics: the log is your only record of them.
+- The harness has no automatic allocation metrics: `rustperf allocs` reads a
+  counting benchmark's own report (opt-in, see `benchmarks/allocs/`), and the
+  log is still your only record of them.
   This fork's harness refuses new or changed `unsafe` (`FAIL(unsafe_added)`),
   so a V7-style variant cannot go through `eval` unless a human set
   `allow_unsafe: true` before `baseline`; measure it by hand instead.

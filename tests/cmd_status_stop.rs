@@ -232,3 +232,57 @@ fn status_with_a_noise_history_still_writes_nothing() {
         "status must only ever read the noise history"
     );
 }
+
+/// Writes `requests.jsonl` into the run's state directory as `rustperf
+/// request` would.
+fn write_requests(dir: &std::path::Path, count: usize) {
+    let mut text = String::new();
+    for i in 0..count {
+        text.push_str(&format!(
+            "{{\"kind\":\"allocator\",\"text\":\"need an arena {i}\",\
+             \"commit\":\"abc1234\",\"experiment\":{}}}\n",
+            i + 1
+        ));
+    }
+    std::fs::write(dir.join("requests.jsonl"), text).expect("write requests");
+}
+
+// I2: pending requests to a human are counted after the noise line, and only
+// while there are some. `status` reads the queue and nothing else.
+#[test]
+fn status_counts_pending_requests_and_only_reads_them() {
+    let repo = ready("t1");
+    let dir = common::state_dir(&repo, "t1");
+
+    // A run with an empty queue says nothing about requests, and `--json` has
+    // no key — not `0`, which would read as "read it, none pending".
+    let text = String::from_utf8_lossy(&common::run_cli(&repo, &["status"]).stdout).into_owned();
+    assert!(!text.contains("pending"), "{text}");
+    let out = common::run_cli(&repo, &["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");
+    assert!(v.get("requests").is_none(), "{v}");
+
+    write_requests(&dir, 2);
+    let queue_before = std::fs::read(dir.join("requests.jsonl")).unwrap();
+    let before = common::tree_snapshot(repo.path());
+
+    let text = String::from_utf8_lossy(&common::run_cli(&repo, &["status"]).stdout).into_owned();
+    assert!(
+        text.contains("requests       2 pending — see 'rustperf report'"),
+        "{text}"
+    );
+    let experiments = text.find("experiments").expect("an experiments line");
+    let requests = text.find("requests").expect("a requests line");
+    assert!(experiments < requests, "{text}");
+
+    let out = common::run_cli(&repo, &["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("one JSON object");
+    assert_eq!(v["requests"], 2);
+
+    assert_eq!(common::tree_snapshot(repo.path()), before);
+    assert_eq!(
+        std::fs::read(dir.join("requests.jsonl")).unwrap(),
+        queue_before,
+        "status must only ever read the request queue"
+    );
+}

@@ -11,9 +11,9 @@ use std::path::PathBuf;
 #[derive(Debug)]
 pub struct Args {
     flags: BTreeMap<String, Option<String>>,
-    /// Non-flag arguments. No command in this task reads these; kept for
-    /// commands added later that take a positional argument.
-    #[allow(dead_code)]
+    /// Non-flag arguments, in the order they appeared. Only `request` reads
+    /// these today: every other command is flags-only, so a stray positional
+    /// there is simply ignored (as it always was).
     pub positional: Vec<String>,
 }
 
@@ -150,5 +150,18 @@ mod tests {
     fn non_flag_arguments_are_collected_as_positional() {
         let a = Args::parse(&argv(&["foo", "bar"]), INIT_FLAGS).unwrap();
         assert_eq!(a.positional, vec!["foo".to_string(), "bar".to_string()]);
+    }
+
+    // `request` is the first command to read these; the words must survive
+    // being interleaved with flags, and a no-value flag must not swallow the
+    // word after it as if it were its value.
+    #[test]
+    fn positional_arguments_are_collected_in_order_around_flags() {
+        let a = Args::parse(&argv(&["need", "--force", "an", "arena"]), INIT_FLAGS).unwrap();
+        assert_eq!(
+            a.positional,
+            vec!["need".to_string(), "an".to_string(), "arena".to_string()]
+        );
+        assert!(a.flag("force"));
     }
 }
